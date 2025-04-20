@@ -1,0 +1,1118 @@
+---
+title: "Condensed report"
+author: "Max Austin - Mada2"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+
+# Set global knitr chunk options to suppress console output in the final document
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# Uncomment the following line to install TinyTeX (required for PDF rendering via LaTeX)
+# install.packages("tinytex")
+# tinytex::install_tinytex()
+
+# Load essential libraries; install if not already present
+# install.packages("readr")
+library(readr)      # For reading CSV and tabular data
+
+# install.packages("dplyr")
+library(dplyr)      # For data manipulation using tidy verbs
+
+# install.packages("tidyr")
+library(tidyr)      # For reshaping and cleaning datasets
+
+# install.packages("stringr")
+library(stringr)    # For consistent string manipulation
+
+# install.packages("ggplot2")
+library(ggplot2)    # For building layered graphics
+
+# install.packages("viridis")
+library(viridis)    # For colorblind-friendly visual palettes
+
+# install.packages("treemap")
+library(treemap)    # For hierarchical and categorical data visualization
+
+# install.packages("corrplot")
+library(corrplot)   # For plotting correlation matrices
+
+# install.packages("cluster")
+library(cluster)    # For clustering algorithms such as k-means and PAM
+
+# install.packages("factoextra")
+library(factoextra) # For extracting and visualizing clustering results
+
+# install.packages("knitr")
+library(knitr)      # For dynamic report generation
+
+# install.packages("igraph")
+library(igraph)     # For constructing network graphs
+
+# install.packages("ggraph")
+library(ggraph)     # For graphing network data using ggplot2 grammar
+
+# install.packages("tidygraph")
+library(tidygraph)  # For manipulating graphs using tidy syntax
+
+# install.packages("reticulate")
+# install.packages("tensorflow")
+# install.packages("keras")
+library(reticulate) # For integrating Python (needed for TensorFlow)
+# reticulate::virtualenv_remove("r-tensorflow") # Optional: remove env if troubleshooting
+
+library(keras)      # High-level neural network API running on TensorFlow
+# keras::install_keras(method = "virtualenv", envname = "r-tensorflow") # Setup environment
+# reticulate::use_virtualenv("r-tensorflow", required = TRUE)
+
+library(tensorflow) # Backend for Keras with GPU acceleration support
+# reticulate::py_config() # Uncomment to verify Python + TensorFlow setup
+# tf$constant("Hello TensorFlow!") # Test line for verifying tensorflow
+
+```
+# Introduction
+
+This paper analyzes the United Kingdom's international trade activity from 1995 to 2023 using data from the CEPII BACI database. The aim is to test whether future UK trade values—total trade, product-level flows, and country-level trade patterns—can be accurately forecasted using current data-based techniques.
+
+To answer this, the report focuses on three significant questions: Will UK volumes of trade rise or fall in coming years? What goods and trading partners will set future trends? And what is difficult when attempting to forecast long-term trade?
+
+The original data comprises over 258 million observations of trade between 238 nations and 5,000 products. It is reduced to UK trade only as an importer or exporter. The work is conducted in four stages: initial exploration and visualization, correlation analysis, product and country clustering, and finally, deep learning models for prediction.
+
+Additional exploratory plots and additional figures are provided in the supplementary PowerPoint appendix due to space constraints.
+
+# Exploration and Visualisation
+```{r include=FALSE}
+## ---------------------------
+## Data Import and Preprocessing
+## ---------------------------
+
+# Define column specification for consistent data parsing
+col_spec <- cols(
+  k = col_character(),  # Product code
+  t = col_double(),     # Year
+  i = col_double(),     # Exporter country code
+  j = col_double(),     # Importer country code
+  v = col_double(),     # Trade value
+  q = col_double()      # Quantity
+)
+
+# Load all annual trade CSV files into a list
+files <- list.files(pattern = "*.csv")
+data_list <- lapply(files[1:29], function(file) {
+  read_csv(file, col_types = col_spec)
+})
+
+# Load supporting metadata for decoding country and product codes
+country_codes <- read_csv("codes/country_codes_V202501.csv")
+product_codes <- read_csv("codes/product_codes_HS92_V202501.csv")  
+
+# Standardize column names for clarity and consistency
+rename_columns <- function(data) {
+  data <- data %>%
+    rename(
+      year = t,
+      exporter = i,
+      importer = j,
+      product = k,
+      value = v,
+      quantity = q
+    )
+  return(data)
+}
+data_list <- lapply(data_list, rename_columns)
+
+# Merge all years into a single dataset
+combined_data <- bind_rows(data_list)
+### Initial size: 258,605,562 observations
+
+# Free memory by removing the list object
+rm(data_list)
+gc()
+
+# Filter to include only trade records where the UK is either the importer or exporter
+combined_data <- combined_data %>%
+  filter(exporter == "826" | importer == "826")
+### After filtering for UK: 13,367,259 observations
+
+# Replace numeric country codes with human-readable names
+replace_country_codes <- function(data) {
+  data <- data %>%
+    mutate(exporter = as.character(exporter),
+           importer = as.character(importer)) %>%
+    
+    left_join(country_codes %>% 
+                mutate(country_code = as.character(country_code)) %>%  
+                select(country_code, country_name) %>% 
+                rename(exporter_name = country_name), 
+              by = c("exporter" = "country_code")) %>%
+    mutate(exporter = exporter_name) %>%
+    select(-exporter_name) %>%
+    
+    left_join(country_codes %>% 
+                mutate(country_code = as.character(country_code)) %>%  
+                select(country_code, country_name) %>% 
+                rename(importer_name = country_name), 
+              by = c("importer" = "country_code")) %>%
+    mutate(importer = importer_name) %>%
+    select(-importer_name)
+  
+  return(data)
+}
+combined_data <- replace_country_codes(combined_data)
+
+# Replace product codes with human-readable descriptions
+replace_product_codes <- function(data) {
+  data <- data %>%
+    mutate(product = as.character(product)) %>%
+    left_join(product_codes %>% 
+                mutate(code = as.character(code)) %>%  
+                select(code, description),  
+              by = c("product" = "code")) %>%
+    mutate(product = description) %>%
+    select(-description)
+  
+  return(data)
+}
+combined_data <- replace_product_codes(combined_data)
+
+# Simplify product labels by removing detailed descriptions after colons
+remove_description_from_product <- function(data) {
+  data <- data %>%
+    mutate(product = sub(":.*", "", product))
+  
+  return(data)
+}
+combined_data <- remove_description_from_product(combined_data)
+
+# Merge multiple petroleum-related categories into a single unified group
+merge_petroleum_rows <- function(data) {
+  petroleum_data <- data %>%
+    filter(grepl("petroleum", product, ignore.case = TRUE)) %>%
+    group_by(year, exporter, importer) %>%
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      product = "Petroleum Products",
+      .groups = "drop"
+    )
+  
+  data <- data %>%
+    filter(!grepl("petroleum", product, ignore.case = TRUE)) %>%
+    bind_rows(petroleum_data)
+  
+  return(data)
+}
+combined_data <- merge_petroleum_rows(combined_data)
+
+# Aggregate duplicate rows based on shared keys (e.g., year, exporter, importer, product)
+merge_rows_by_group <- function(data) {
+  data <- data %>%
+    group_by(year, exporter, importer, product) %>%
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      .groups = "drop"
+    )
+  return(data)
+}
+combined_data <- merge_rows_by_group(combined_data)
+### Final size: 4,958,186 observations
+
+# Separate dataset for UK as exporter
+uk_exporter_data <- combined_data %>%
+  filter(exporter == "United Kingdom")
+### UK Export observations: 3,385,077
+
+# Separate dataset for UK as importer
+uk_importer_data <- combined_data %>%
+  filter(importer == "United Kingdom")
+### UK Import observations: 1,588,878
+
+# Summarize trade values for interpretation
+importsum <- sum(uk_importer_data$value)
+exportsum <- sum(uk_exporter_data$value)
+
+# Clean up the environment to reduce memory usage
+rm(col_spec, files, country_codes, product_codes,
+   rename_columns, replace_country_codes, replace_product_codes,
+   remove_description_from_product, merge_petroleum_rows, merge_rows_by_group)
+gc()
+
+
+```
+Before analysis, the raw CEPII BACI dataset of more than 258 million records of international trade was pre-filtered to keep only rows where the UK imported or exported. This reduced the dataset to 13.4 million observations.
+
+Product categories were originally 6-digit Harmonized System (HS) codes and country codes were numeric and both replaced with descriptive labels. Products were too broad in their detail (e.g., 21 varieties of meat, multiple varieties of coffee and eggs), so these were merged into more general product categories where feasible.
+
+After cleansing and consolidation post, the dataset came down to 4.96 million observations around equal to `r (4973955 / 258605562 * 100)`% of the initial dataset. They consist of 3.39 million exports and 1.59 million imports.
+
+In spite of additional export deals of quantity, this does not include greater trading value. There are greater total values of import over the period for UK compared to exports, with its net trading balance being `r exportsum - importsum`, which is equal to continuous deficit.
+
+# Visualisation
+
+## Trade value over time
+
+Figure X illustrates the UK's net trade, import, and export totals between 1995 and 2022. Exports (purple) and imports (teal) exhibit steady growth up to 2008, when they varied depending on world economic turning points. Net trade (yellow), always in negative figures, shows a persistent and growing trade deficit—especially after 2015.
+
+Severe economic shocks such as the 2008 financial crisis and pandemic 2020 triggered sharp declines in trade, then partial recoveries. Post-Brexit (2016) onwards, export growth plateaus while imports remain unchanged, which indicates emerging new trade frictions.
+
+This historical trade deficit bears witness to UK dependence on imports and highlights the challenge of export competitiveness.
+``` {r}
+# Plot total export, import, and net trade values for the UK over time
+
+combined_data %>%
+  # Filter for records where the UK is either the exporter or importer
+  filter(exporter == "United Kingdom" | importer == "United Kingdom") %>%
+  
+  # Group by year to compute annual aggregates
+  group_by(year) %>%
+  summarise(
+    export_value = sum(value[exporter == "United Kingdom"], na.rm = TRUE),  # Total exports by UK
+    import_value = sum(value[importer == "United Kingdom"], na.rm = TRUE),  # Total imports to UK
+    net_value = export_value - import_value,  # Net trade balance
+    .groups = "drop"
+  ) %>%
+  
+  # Reshape data for plotting: long format by trade type
+  gather(key = "type", value = "value", export_value, import_value, net_value) %>%
+  
+  # Create line plot with time on the x-axis and trade values on the y-axis
+  ggplot(aes(x = year, y = value, color = type)) +
+  geom_line(size = 1) +
+  scale_color_viridis(discrete = TRUE) +  # Use colorblind-friendly palette
+  labs(title = "Export, Import, and Net Value Over Time",
+       x = "Year",
+       y = "Value") +
+  theme_minimal() +
+  theme(legend.title = element_blank())  # Clean legend formatting
+
+```
+## Stacked Area Plots
+
+The stacked area plots indicate the UK's export and import values with its top ten trading partners between 1995 and 2023. Export values rose steadily until the late 2010s, led consistently by the US, Germany, France, and the Netherlands. Imports also rose, with Germany, China, and the US being leading suppliers. Notably, China's role expanded exponentially in the 2000s. Both graphs identify the UK's historic reliance on its key European and world partners, and the persistent import and export value deficit is a signal of a long-term structural trade deficit.
+
+``` {r}
+# Plot the UK's export values to its top 10 importing countries over time
+
+combined_data %>%
+  # Filter records where the UK is the exporter
+  filter(exporter == "United Kingdom") %>%
+  
+  # Aggregate total export value by year and importing country
+  group_by(year, importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  
+  # Within each year, rank importers by total export value
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_export_value))) %>%
+  filter(rank <= 10) %>%  # Retain only top 10 importers each year
+  
+  ungroup() %>%
+  
+  # Ensure complete year-importer combinations for smooth area plotting
+  complete(year, importer, fill = list(total_export_value = 0)) %>%
+  
+  # Plot as stacked area chart
+  ggplot(aes(x = year, y = total_export_value, fill = importer)) +
+  geom_area(alpha = 0.6) +  # Add transparency for clarity
+  scale_fill_viridis(discrete = TRUE) +  # Use colorblind-friendly palette
+  labs(
+    title = "Export Value Over Time by Top 10 Importers",
+    x = "Year",
+    y = "Export Value"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot the UK's import values from its top 10 exporting countries over time
+
+combined_data %>%
+  # Filter data to retain only records where the UK is the importer
+  filter(importer == "United Kingdom") %>%
+  
+  # Calculate total import value grouped by year and exporting country
+  group_by(year, exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  
+  # Within each year, rank exporters by total import value
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_import_value))) %>%
+  filter(rank <= 10) %>%  # Keep only the top 10 exporters per year
+  
+  ungroup() %>%
+  
+  # Fill in missing year-exporter combinations with zero for smooth plotting
+  complete(year, exporter, fill = list(total_import_value = 0)) %>%
+  
+  # Generate a stacked area chart to visualize import trends
+  ggplot(aes(x = year, y = total_import_value, fill = exporter)) +
+  geom_area(alpha = 0.6) +  # Add transparency for better layering visibility
+  scale_fill_viridis(discrete = TRUE) +  # Colorblind-friendly palette
+  labs(
+    title = "Import Value Over Time by Top 10 Exporters",
+    x = "Year",
+    y = "Import Value"
+  ) +
+  theme_minimal()
+
+```
+# correlations
+
+## Correlation between trade partners
+
+These two correlation matrices highlight the UK's prime trading partners segregated according to whether they are being exported to (left) or imported from (right). Exporting, the UK is extremely positively correlated with most of Europe's partners—Germany, France, Ireland, and the Netherlands—sitting in synchronised export trends into these countries. The USA, being an important partner, is less correlated, likely reflecting differences in economic cycles. On the import side, the relationships are closer still, especially between EU countries, and could reflect coordinated supply chains and integrated buying from the single market. On aggregate, the matrices reveal strong regional trade linkages, useful for identifying co-movements in trade volume that impact future projections.
+```{r}
+top_10_importers_aggregated <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(importer) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_import_value)) %>%
+  top_n(10, total_import_value)
+
+top_10_importer_data_agg <- combined_data %>%
+  filter(exporter == "United Kingdom" & importer %in% top_10_importers_aggregated$importer) %>%
+  group_by(year, importer) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = importer, value = total_value)
+
+importer_correlation_matrix <- cor(top_10_importer_data_agg[, -1], use = "complete.obs")
+
+corrplot(importer_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+```
+
+```{r}
+# Extract the top 10 countries that import the highest total trade value from the United Kingdom
+top_10_importers_aggregated <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(importer) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_import_value)) %>%
+  top_n(10, total_import_value)
+
+# Aggregate annual trade values for the top 10 importers from the United Kingdom
+top_10_importer_data_agg <- combined_data %>%
+  filter(exporter == "United Kingdom" & importer %in% top_10_importers_aggregated$importer) %>%
+  group_by(year, importer) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = importer, value = total_value)  # Reshape data to wide format for correlation analysis
+
+# Compute the correlation matrix between importing countries based on annual trade values
+importer_correlation_matrix <- cor(top_10_importer_data_agg[, -1], use = "complete.obs")
+
+# Generate a circular correlation plot (upper triangle) for visual comparison between top importers
+corrplot(importer_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+```
+```{r include=FALSE}
+# Filter UK-related trade data for separate analysis as importer and exporter
+uk_import_data <- combined_data %>%
+  filter(importer == "United Kingdom")
+
+uk_export_data <- combined_data %>%
+  filter(exporter == "United Kingdom")
+
+# Identify the top 20 trade partners and products for both import and export
+top_exporters <- uk_import_data %>%
+  group_by(exporter) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(exporter)
+
+top_import_products <- uk_import_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(product)
+
+top_importers <- uk_export_data %>%
+  group_by(importer) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(importer)
+
+top_export_products <- uk_export_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(product)
+
+# Create and cluster matrices based on yearly trade values
+
+# Cluster countries exporting to the UK
+exporter_matrix <- uk_import_data %>%
+  filter(exporter %in% top_exporters) %>%
+  group_by(exporter, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+exporter_data <- exporter_matrix %>% select(-exporter)
+set.seed(42)
+exporter_clusters <- kmeans(exporter_data, centers = 4)
+
+exporter_cluster_result <- exporter_matrix %>%
+  mutate(cluster = exporter_clusters$cluster)
+
+# Cluster top import products of the UK
+import_product_matrix <- uk_import_data %>%
+  filter(product %in% top_import_products) %>%
+  group_by(product, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+import_product_data <- import_product_matrix %>% select(-product)
+set.seed(42)
+import_product_clusters <- kmeans(import_product_data, centers = 4)
+
+import_product_cluster_result <- import_product_matrix %>%
+  mutate(cluster = import_product_clusters$cluster)
+
+# Cluster countries importing from the UK
+importer_matrix <- uk_export_data %>%
+  filter(importer %in% top_importers) %>%
+  group_by(importer, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+importer_data <- importer_matrix %>% select(-importer)
+set.seed(42)
+importer_clusters <- kmeans(importer_data, centers = 4)
+
+importer_cluster_result <- importer_matrix %>%
+  mutate(cluster = importer_clusters$cluster)
+
+# Cluster top export products from the UK
+export_product_matrix <- uk_export_data %>%
+  filter(product %in% top_export_products) %>%
+  group_by(product, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+export_product_data <- export_product_matrix %>% select(-product)
+set.seed(42)
+export_product_clusters <- kmeans(export_product_data, centers = 4)
+
+export_product_cluster_result <- export_product_matrix %>%
+  mutate(cluster = export_product_clusters$cluster)
+
+# ---- Visualization ----
+
+# Graph: Clustered import products (UK as importer)
+product_names_import <- import_product_cluster_result$product
+product_values_import <- import_product_cluster_result %>%
+  select(-product, -cluster) %>%
+  as.matrix()
+rownames(product_values_import) <- product_names_import
+
+cor_matrix_import <- cor(t(product_values_import), use = "pairwise.complete.obs")
+cor_edges_import <- which(upper.tri(cor_matrix_import) & cor_matrix_import > 0.8, arr.ind = TRUE)
+
+edge_list_import <- data.frame(
+  from = rownames(cor_matrix_import)[cor_edges_import[, 1]],
+  to = rownames(cor_matrix_import)[cor_edges_import[, 2]]
+)
+
+node_info_import <- import_product_cluster_result %>%
+  mutate(name = product,
+         total_value = rowSums(select(., -product, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_import <- graph_from_data_frame(d = edge_list_import, vertices = node_info_import, directed = FALSE)
+
+# Graph: Clustered export products (UK as exporter)
+product_names_export <- export_product_cluster_result$product
+product_values_export <- export_product_cluster_result %>%
+  select(-product, -cluster) %>%
+  as.matrix()
+rownames(product_values_export) <- product_names_export
+
+cor_matrix_export <- cor(t(product_values_export), use = "pairwise.complete.obs")
+cor_edges_export <- which(upper.tri(cor_matrix_export) & cor_matrix_export > 0.8, arr.ind = TRUE)
+
+edge_list_export <- data.frame(
+  from = rownames(cor_matrix_export)[cor_edges_export[, 1]],
+  to = rownames(cor_matrix_export)[cor_edges_export[, 2]]
+)
+
+node_info_export <- export_product_cluster_result %>%
+  mutate(name = product,
+         total_value = rowSums(select(., -product, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_export <- graph_from_data_frame(d = edge_list_export, vertices = node_info_export, directed = FALSE)
+
+# Graph: Clustered exporting countries to UK (UK as importer)
+exporter_names_import <- exporter_cluster_result$exporter
+exporter_values_import <- exporter_cluster_result %>%
+  select(-exporter, -cluster) %>%
+  as.matrix()
+rownames(exporter_values_import) <- exporter_names_import
+
+cor_matrix_exporter_import <- cor(t(exporter_values_import), use = "pairwise.complete.obs")
+cor_edges_exporter_import <- which(upper.tri(cor_matrix_exporter_import) & cor_matrix_exporter_import > 0.8, arr.ind = TRUE)
+
+edge_list_exporter_import <- data.frame(
+  from = rownames(cor_matrix_exporter_import)[cor_edges_exporter_import[, 1]],
+  to = rownames(cor_matrix_exporter_import)[cor_edges_exporter_import[, 2]]
+)
+
+node_info_exporter_import <- exporter_cluster_result %>%
+  mutate(name = exporter,
+         total_value = rowSums(select(., -exporter, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_exporter_import <- graph_from_data_frame(d = edge_list_exporter_import, vertices = node_info_exporter_import, directed = FALSE)
+
+# Graph: Clustered importing countries from UK (UK as exporter)
+importer_names_export <- importer_cluster_result$importer
+importer_values_export <- importer_cluster_result %>%
+  select(-importer, -cluster) %>%
+  as.matrix()
+rownames(importer_values_export) <- importer_names_export
+
+cor_matrix_importer_export <- cor(t(importer_values_export), use = "pairwise.complete.obs")
+cor_edges_importer_export <- which(upper.tri(cor_matrix_importer_export) & cor_matrix_importer_export > 0.8, arr.ind = TRUE)
+
+edge_list_importer_export <- data.frame(
+  from = rownames(cor_matrix_importer_export)[cor_edges_importer_export[, 1]],
+  to = rownames(cor_matrix_importer_export)[cor_edges_importer_export[, 2]]
+)
+
+node_info_importer_export <- importer_cluster_result %>%
+  mutate(name = importer,
+         total_value = rowSums(select(., -importer, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_importer_export <- graph_from_data_frame(d = edge_list_importer_export, vertices = node_info_importer_export, directed = FALSE)
+
+
+```
+
+The clustering diagrams reveal how UK trade relationships group naturally based on trade similarity. In the import clusters (left), the majority of European exporters—including Germany, Italy, Spain, and Belgium—form a dense, interconnected network, suggesting similar trade patterns and co-movement in supply. The USA and Asian partners appear more isolated, indicating distinct dynamics. The export clusters (right) show a comparable trend, with Western nations such as France, Germany, and Canada forming cohesive groups, while emerging markets like the UAE, India, and Singapore form their own separate hub. These clusters highlight patterns not obvious through raw trade values alone, revealing hidden structure that supports the motivation for using deep learning models to detect and learn such implicit trade relationships. Identifying these latent clusters helps inform model design by emphasizing the importance of modeling interaction effects between countries and products—precisely the kind of complex structure deep learning is well-suited to capture.
+```{r}
+# Visualize clustered exporters to the UK using a force-directed graph layout
+ggraph(graph_exporter_import, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(
+    title = "Exporter Clusters - UK Imports",
+    color = "Cluster",
+    size = "Total Value"
+  )
+
+```
+```{r}
+# Visualize clustered importers from the UK using a force-directed network graph
+ggraph(graph_importer_export, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(
+    title = "Importer Clusters - UK Exports",
+    color = "Cluster",
+    size = "Total Value"
+  )
+
+```
+
+```{r include=FALSE}
+# Remove all objects from the environment except 'combined_data' to reduce memory usage
+rm(list = setdiff(ls(), c("combined_data")))
+gc()  # Run garbage collection to free up unused memory
+
+```
+
+# deep learning
+
+## Methods
+
+Two deep learning models were created to forecast UK trade values, one for when the United Kingdom is an importer and one for when it is an exporter. These models were implemented using the Keras API in TensorFlow (version 2.10.0) under the R environment. To prepare the data for modeling, all trade transactions worth less than 5,000 were removed in an effort to reduce noise and prevent the likelihood of overfitting. Categorical columns such as trade partners and product types were embedded to integers and passed through embedding layers to learn their internal representation. Numerical features such as trade year and trade value were normalized to have zero mean and unit variance.
+
+Both models were trained using 30 epochs and a batch size of 216, selected after trying different combinations of hyperparameters. This configuration provided consistent stable performance and avoided convergence issues associated with larger or smaller batch sizes. Mixed precision training (with the mixed_float16 policy) was also enabled to improve training efficiency without sacrificing numerical accuracy.
+
+The loss function used was mean squared error (MSE), with mean absolute error (MAE) tracked as a secondary performance measure. A validation split of 20% was used in training, and shuffling was enabled to aid generalization. Model performance was monitored while training via training history plots. Both models displayed steady convergence and minimal divergence between training and validation error curves, indicating high generalization and no overfitting evidence
+
+```{r}
+# Enable mixed precision training to improve performance on supported hardware
+policy <- tf$keras$mixed_precision$Policy("mixed_float16")
+
+# Remove the 'quantity' column, which is not used in modeling
+combined_data_dl <- combined_data %>%
+  select(-quantity)
+
+# --- Prepare UK Export Data ---
+
+# Filter and encode categorical variables for the UK as an exporter
+uk_export_data <- combined_data_dl %>%
+  filter(exporter == "United Kingdom") %>%
+  mutate(
+    importer = as.integer(factor(importer)),  # Encode importer as integer
+    product = as.integer(factor(product))     # Encode product as integer
+  ) %>%
+  filter(!is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+
+# --- Prepare UK Import Data ---
+
+# Filter and encode categorical variables for the UK as an importer
+uk_import_data <- combined_data_dl %>%
+  filter(importer == "United Kingdom") %>%
+  mutate(
+    exporter = as.integer(factor(exporter)),  # Encode exporter as integer
+    product = as.integer(factor(product))     # Encode product as integer
+  ) %>%
+  filter(!is.na(exporter) & !is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+
+# Store categorical level mappings (useful for decoding later)
+exporter_levels <- levels(factor(combined_data$exporter))
+importer_levels <- levels(factor(combined_data$importer))
+product_levels <- levels(factor(combined_data$product))
+
+# Normalize numeric columns ('value' and 'year') for both import and export datasets
+uk_export_data <- uk_export_data %>%
+  mutate(
+    value = scale(value),
+    year = scale(year)
+  )
+
+uk_import_data <- uk_import_data %>%
+  mutate(
+    value = scale(value),
+    year = scale(year)
+  )
+
+# Split into features (X) and target (y) for export and import models
+X_exporter <- uk_export_data %>% select(-value, -exporter)
+y_exporter <- uk_export_data$value
+
+X_importer <- uk_import_data %>% select(-value, -importer)
+y_importer <- uk_import_data$value
+
+# --- Define Deep Learning Model for UK as Exporter ---
+
+# Define input layers for categorical features
+importer_input <- layer_input(shape = 1, name = "importer_input")
+product_input <- layer_input(shape = 1, name = "product_input")
+
+# Embedding layers for importer and product
+importer_embedding <- importer_input %>%
+  layer_embedding(input_dim = length(unique(X_exporter$importer)) + 1, output_dim = 10)
+
+product_embedding <- product_input %>%
+  layer_embedding(input_dim = length(unique(X_exporter$product)) + 1, output_dim = 10)
+
+# Flatten embedding outputs
+importer_embedding_flat <- importer_embedding %>% layer_flatten()
+product_embedding_flat <- product_embedding %>% layer_flatten()
+
+# Input layer for normalized numeric variables (e.g., year)
+numeric_input <- layer_input(shape = ncol(X_exporter) - 2, name = "numeric_input")  # Exclude categorical columns
+
+# Concatenate embeddings with numeric input
+concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
+
+# Add dense layers for regression
+dense_layer <- concatenated %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, dtype = "float32")  # Ensure final output is float32 for numerical stability
+
+# Build the Keras model
+exporter_model <- keras_model(
+  inputs = list(importer_input, product_input, numeric_input),
+  outputs = dense_layer
+)
+
+# Compile the model with regression loss and evaluation metric
+exporter_model %>% compile(
+  loss = "mse",  # Mean Squared Error for regression
+  optimizer = optimizer_adam(),
+  metrics = c("mae")  # Mean Absolute Error as additional evaluation metric
+)
+
+# --- Prepare Inputs for Model Training ---
+
+# Prepare input tensors for the exporter model
+importer_input_data <- as.integer(X_exporter$importer)
+product_input_data <- as.integer(X_exporter$product)
+
+numeric_input_data <- X_exporter %>%
+  select(-importer, -product) %>%
+  as.matrix()  # Convert to numeric matrix for input compatibility
+
+# Convert target to numeric type
+y_exporter <- as.numeric(y_exporter)
+
+
+```
+
+# Training
+## Exporter Model Training Performance
+ 
+The exporter model shows a steady decrease in training loss and MAE, indicating consistent learning over the 30 epochs. While validation loss is decreasing early on as well, it begins to stabilize and fluctuate from roughly epoch 15, which means that while the model generalizes reasonably well, its capacity for continued improvement decreases. Validation MAE remains close to training MAE across the board with no clear sign of overfitting but with a hint of limited predictive variability acquired for unseen observations.
+
+```{r include=FALSE}
+# Train the deep learning model for predicting UK exports
+exporter_history <- exporter_model %>% fit(
+  x = list(
+    importer_input = importer_input_data,
+    product_input = product_input_data,
+    numeric_input = numeric_input_data
+  ),
+  y = y_exporter,
+  epochs = 30,               # Number of training epochs
+  batch_size = 216,          # Batch size for training
+  validation_split = 0.2,    # Reserve 20% of data for validation
+  shuffle = TRUE             # Shuffle the training data before each epoch
+)
+
+
+```
+```{r}
+# Plot training and validation loss/metrics over epochs for the exporter model
+plot(exporter_history) + 
+  ggtitle("Exporter Model Training History")
+```
+
+```{r include=FALSE}
+# ----------------------------------------
+# Deep Learning Model for UK as Importer
+# ----------------------------------------
+
+# Define input layers for categorical features: exporter and product
+importer_input <- layer_input(shape = 1, name = "importer_input")
+product_input <- layer_input(shape = 1, name = "product_input")
+
+# Embedding layers for categorical variables
+importer_embedding <- importer_input %>%
+  layer_embedding(input_dim = length(unique(X_importer$exporter)) + 1, output_dim = 10)
+
+product_embedding <- product_input %>%
+  layer_embedding(input_dim = length(unique(X_importer$product)) + 1, output_dim = 10)
+
+# Flatten the embedding outputs
+importer_embedding_flat <- importer_embedding %>% layer_flatten()
+product_embedding_flat <- product_embedding %>% layer_flatten()
+
+# Define input layer for numeric variables (e.g., scaled year)
+numeric_input <- layer_input(shape = ncol(X_importer) - 2, name = "numeric_input")  # Exclude 'exporter' and 'product'
+
+# Concatenate all input features
+concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
+
+# Fully connected layers for regression
+dense_layer <- concatenated %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, dtype = "float32")  # Ensure final output uses float32 for precision compatibility
+
+# Build the Keras model
+importer_model <- keras_model(
+  inputs = list(importer_input, product_input, numeric_input),
+  outputs = dense_layer
+)
+
+# Compile the model with appropriate loss and evaluation metric
+importer_model %>% compile(
+  loss = "mse",          # Mean Squared Error for regression
+  optimizer = optimizer_adam(),
+  metrics = c("mae")     # Mean Absolute Error for evaluation
+)
+
+# Prepare input tensors for model training
+importer_input_data <- as.integer(X_importer$exporter)  # Integer encoding for exporters
+product_input_data <- as.integer(X_importer$product)    # Integer encoding for products
+
+numeric_input_data_importer <- X_importer %>%
+  select(-exporter, -product) %>%
+  as.matrix()  # Convert numeric features to matrix form
+
+```
+
+## Importer Model Training Performance
+
+The importer model also displays a comparable trend of shrinking training loss and MAE, and flattening validation metrics at around midpoint training. The gap between training and validation curves is reasonably small, giving credence to the model's stability. Validation MAE's slight decline in later epochs also indicates soft late-stage generalization improvement, but the occasional jitter indicates some batch composition sensitivity or minimal underfitting in more complex import relations.
+
+```{r include=FALSE}
+# Train the deep learning model for predicting UK imports
+importer_history <- importer_model %>% fit(
+  x = list(
+    importer_input = importer_input_data,
+    product_input = product_input_data,
+    numeric_input = numeric_input_data_importer
+  ),
+  y = y_importer,
+  epochs = 30,               # Number of training epochs
+  batch_size = 216,          # Batch size for each training step
+  validation_split = 0.2,    # Use 20% of the data for validation
+  shuffle = TRUE             # Shuffle training data at the beginning of each epoch
+)
+
+```
+
+```{r}
+# Plot training and validation metrics across epochs for the importer model
+plot(importer_history) + 
+  ggtitle("Importer Model Training History")
+
+```
+
+```{r}
+# ----------------------------------------
+# Forecasting Future UK Trade (2020–2030)
+# Using Trained Deep Learning Models
+# ----------------------------------------
+
+# Define the range of future years for prediction
+future_years <- 2020:2030
+
+# Identify the top 10 most traded products and trade partners (by historical value)
+top10_export_products <- uk_export_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(product)
+
+top10_import_products <- uk_import_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(product)
+
+top10_export_countries <- uk_export_data %>%
+  group_by(importer) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(importer)
+
+top10_import_countries <- uk_import_data %>%
+  group_by(exporter) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(exporter)
+
+# Define a helper function to scale year values using training distribution
+scale_year <- function(years, mean_val, sd_val) {
+  return((years - mean_val) / sd_val)
+}
+
+# Retrieve scaling parameters from training data for inverse transformation
+year_mean_export <- attr(uk_export_data$year, "scaled:center")
+year_sd_export <- attr(uk_export_data$year, "scaled:scale")
+year_mean_import <- attr(uk_import_data$year, "scaled:center")
+year_sd_import <- attr(uk_import_data$year, "scaled:scale")
+
+# --- Prepare Forecast Data for UK as Exporter ---
+
+export_forecast_data <- data.frame(
+  year = rep(future_years, each = length(top10_export_products)),
+  product = rep(top10_export_products, times = length(future_years)),
+  importer = rep(top10_export_countries, times = length(future_years)),
+  value = NA  # Placeholder for predicted values
+)
+
+# Generate predictions for UK exports
+export_preds <- exporter_model %>% predict(list(
+  importer_input = as.integer(export_forecast_data$importer),
+  product_input = as.integer(export_forecast_data$product),
+  numeric_input = as.matrix(scale_year(export_forecast_data$year, year_mean_export, year_sd_export))
+))
+
+# Rescale predictions back to original value range
+export_forecast_data$predicted_value <- as.numeric(
+  export_preds * attr(uk_export_data$value, "scaled:scale") +
+  attr(uk_export_data$value, "scaled:center")
+)
+
+# --- Prepare Forecast Data for UK as Importer ---
+
+import_forecast_data <- data.frame(
+  year = rep(future_years, each = length(top10_import_products)),
+  product = rep(top10_import_products, times = length(future_years)),
+  exporter = rep(top10_import_countries, times = length(future_years)),
+  value = NA  # Placeholder for predicted values
+)
+
+# Generate predictions for UK imports
+import_preds <- importer_model %>% predict(list(
+  importer_input = as.integer(import_forecast_data$exporter),
+  product_input = as.integer(import_forecast_data$product),
+  numeric_input = as.matrix(scale_year(import_forecast_data$year, year_mean_import, year_sd_import))
+))
+
+# Rescale predictions back to original value range
+import_forecast_data$predicted_value <- as.numeric(
+  import_preds * attr(uk_import_data$value, "scaled:scale") +
+  attr(uk_import_data$value, "scaled:center")
+)
+
+# --- Decode integer-encoded categorical variables back to labels ---
+
+export_forecast_data$importer_label <- importer_levels[export_forecast_data$importer]
+export_forecast_data$product_label <- product_levels[export_forecast_data$product]
+
+import_forecast_data$exporter_label <- exporter_levels[import_forecast_data$exporter]
+import_forecast_data$product_label <- product_levels[import_forecast_data$product]
+
+
+
+```
+## Summary of training
+Both exporter and importer models register consistent decreases in training loss and mean absolute error (MAE), with validation curves platuing halfway through training. The comparatively narrow and consistent gap between training and validation metrics is an expression of high generalization and minimum risk of overfitting. Whereas the exporter model is consistently performing well across, the importer model experiences moderate declines in late-stage performance and occasional fluctuations, presumably as a result of batch variation or more intricate import dynamics. In general, both models converged and are suitable for prediction.
+
+# Results
+## Forecasted Total Trade Overview
+Figure X illustrates estimated overall UK imports, exports, and net trade from 2023 to 2030. Imports (red) and exports (blue) are both estimated to gradually decline, with imports always in excess, once again maintaining a chronic rising trade deficit (black dashed line). This may reflect increasing dependence on imported foreign goods and poorer export performance.
+
+```{R}
+# ----------------------------------------
+# Total Forecasted Trade Summary (2020–2030)
+# ----------------------------------------
+
+# Calculate total predicted export values by year
+export_totals <- export_forecast_data %>%
+  group_by(year) %>%
+  summarise(export_value = sum(predicted_value), .groups = "drop")
+
+# Calculate total predicted import values by year
+import_totals <- import_forecast_data %>%
+  group_by(year) %>%
+  summarise(import_value = sum(predicted_value), .groups = "drop")
+
+# Combine export and import totals into a single data frame
+combined_totals <- full_join(export_totals, import_totals, by = "year") %>%
+  mutate(
+    net_trade = import_value - export_value  # Net trade balance (positive = deficit, negative = surplus)
+  )
+
+# Plot forecasted imports, exports, and net trade over time
+ggplot(combined_totals, aes(x = year)) +
+  geom_line(aes(y = export_value, color = "Export"), size = 1) +
+  geom_line(aes(y = import_value, color = "Import"), size = 1) +
+  geom_line(aes(y = net_trade), color = "black", linetype = "dashed", size = 1) +
+  labs(
+    title = "Forecasted Total Import & Export (with Net Trade Balance)",
+    y = "Trade Value",
+    color = "Trade Type"
+  ) +
+  scale_color_manual(values = c("Export" = "blue", "Import" = "red")) +
+  theme_minimal()
+```
+
+# Export top 10 producs
+
+Figure X displays export forecasts by commodity. Vehicles remain the biggest but are projected to plummet by a huge margin. Other huge groups such as medicaments, engines, and petroleum products also fall, though at a more moderate pace. The simultaneous tendencies across goods are explained by the autoregressive characteristics of the model, which has a tendency to yield conservative and smoothened forecasts.
+
+```{R}
+# Plot forecasted export values by year for the top 10 export products
+ggplot(export_forecast_data %>% filter(product %in% top10_export_products),
+       aes(x = year, y = predicted_value, color = product_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(
+    title = "Forecasted Export Value for Top 10 Products",
+    y = "Export Value",
+    color = "Product"
+  )
+```
+
+# Import top 10 producs
+
+Figure X shows UK import projections of the country's leading imported goods. Oils and cars lead in terms of number, with most categories—like metals, chemicals, and machinery—exhibiting flat or gradually declining trends. As indicated above, the smoothing bias of the model may downwardly bias volatility in sectoral demand.
+
+```{r}
+# Truncate long product labels for cleaner visualization
+import_forecast_data$short_label <- stringr::str_trunc(import_forecast_data$product_label, width = 30)
+
+# Plot forecasted import values by year for the top 10 import products
+ggplot(import_forecast_data %>%
+         filter(product %in% top10_import_products),
+       aes(x = year, y = predicted_value, color = short_label)) +
+  geom_line() +
+  labs(
+    title = "Forecasted Import Value for Top 10 Products",
+    y = "Import Value",
+    color = "Product"
+  ) +
+  theme_minimal()
+
+
+```
+
+# Export top 10 Countries
+
+Figure X displays forecasted export values to the UK's main trading partners. The USA remains the biggest recipient, followed by Germany and the Netherlands. All partners, though, show marginal decreases in export value, with no sign of growth in any nation, in support of the forecasted export contraction.
+
+```{r}
+# Plot forecasted export values by year for the top 10 importing countries
+# (Note: 'importer' refers to the receiving country in export data)
+ggplot(export_forecast_data %>% 
+         filter(importer %in% top10_export_countries) %>%
+         mutate(importer_label = importer_levels[importer]),
+       aes(x = year, y = predicted_value, color = importer_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(
+    title = "Forecasted Export Value by Top 10 Countries",
+    y = "Export Value",
+    color = "Country"
+  )
+```
+
+# Import top 10 countries
+Figure X shows UK imports from its top suppliers. Germany and China dominate, with other countries such as the USA, France, and the Netherlands showing similar falling trends. That none of these exporters is expected to increase indicates a general downturn in incoming trade.
+
+```{r}
+# Plot forecasted import values by year for the top 10 exporting countries
+# (Note: 'exporter' refers to the sending country in import data)
+ggplot(import_forecast_data %>%
+         filter(exporter %in% top10_import_countries) %>%
+         mutate(exporter_label = exporter_levels[exporter]),
+       aes(x = year, y = predicted_value, color = exporter_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(
+    title = "Forecasted Import Value by Top 10 Countries",
+    y = "Import Value",
+    color = "Country"
+  )
+
+```
+## Deep learning conclusion
+
+The deep learning models developed for UK trade value prediction operated in a consistent way for both export and import scenarios. By encoding categorical variables and normalizing numerical values, the models picked up on general trends within historical trade data and made consistent predictions across countries and products.
+
+However, due to the autoregressive nature of the forecasting process—where each future value is forecasted in relation to previously forecasted inputs—the results are smoothed and conservative. This is evidenced in the flat or gradually declining trends across all groups. Although reflecting the robustness of the model in identifying patterns, this limits the responsiveness of the model to abrupt economic shocks, policy shifts, or random changes in demand.
+
+Lastly, the models provide a helpful high-level view of potential future trade patterns, highlighting the UK's persistent trade deficit and worsening export performance. However, for short-term forecasting or sectoral detail, complementary methods employing external variables or real-time indicators may be required to capture the complete richness of international trade.
+
+# Final conclusion
+
+This report explored the potential for forecasting UK international trade flows using data-driven methods. The primary research questions—whether to expect expansion or a decline in UK trade, which partners and products will dominate future flows, and what are the pitfalls of forecasting long-term trade—have been addressed by a multi-stage investigation.
+
+After data cleaning and visualization of CEPII BACI trade data, UK export and import trends were analyzed over time. Product and country level trends indicated underlying interdependencies and long-term dynamics, e.g., impacts of global events and shifting trade alliances. Cluster analysis identified hidden groupings among goods and trading partners, offering insight into interdependent economic activities.
+
+The core forecasting task was met with two deep learning models, one for UK imports and one for UK exports. These models captured general directional tendencies and produced stable forecasts but also demonstrated hallmark weaknesses of autoregressive deep learning, such as smoothing of uncertainty and subdued short-run volatility. For each of these, the models appropriately forecast future decreases in trade volumes and expanding trade deficits—results of considerable economic and policy significance.
+
+Taken together, the analysis demonstrates how machine learning can provide valuable insight into the future of UK trade, along with the need for careful interpretation of long-term projections from data-driven models.
+
+# Reference
+
+https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37
+
+# appendix
+All code and supporting documents are available on github in the following perma link
+https://github.com/maxaus2002/ASSESSMENT-2-for-MAST7220/tree/4ee2afca34a870aa6cfba57fd4bb3f3344b36c84
+
+Full version of report available on github
+Accompanying power point available on github (Mainly contains condesned versions of data ommitted from the condensed report but were present in the full report.)
