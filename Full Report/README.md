@@ -1,2 +1,3 @@
-The Full X Page long report in PDF Form
-The RMD code
+This folder contains the;
+  - 34 page long full report
+  - The RMD code
