@@ -1202,7 +1202,7 @@ Overall, the training curves reflect good model performance with good convergenc
 
 
 
-```{r include=FALSE}
+```{r }
 # Train the UK Exporter model
 exporter_history <- exporter_model %>% fit(
   x = list(
@@ -1281,7 +1281,7 @@ In the bottom panel, training MAE drops steadily throughout training and ends ju
 Together, these curves point to stable learning dynamics and a well-generalizing model. The importer model has good convergence, maintains low prediction error, and avoids overfitting—making it sufficient to generate reliable trade predictions on future UK import data.
 
 
-```{r}
+```{r include=FALSE}
 # Train the UK Importer model
 importer_history <- importer_model %>% fit(
   x = list(
