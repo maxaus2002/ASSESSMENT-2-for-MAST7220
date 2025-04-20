@@ -1,2 +1,3 @@
-
-Include all of the files as displayed in the same directory that the rmd file is located
+Extract the file,
+move the rmd file to the data folder,
+and run as is.
