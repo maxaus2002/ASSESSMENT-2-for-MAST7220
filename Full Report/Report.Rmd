@@ -1,0 +1,1558 @@
+---
+title: "Report - Full"
+author: "Max Austin - Mada 2"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+#install.packages("tinytex")
+#tinytex::install_tinytex()
+
+#install.packages("readr")
+library(readr)
+
+#install.packages("dplyr")
+library(dplyr)
+
+#install.packages("tidyr")
+library(tidyr)
+
+#install.packages("stringr")
+library(stringr)
+
+#install.packages("ggplot2")
+library(ggplot2)
+
+#install.packages("viridis")
+library(viridis)
+
+#install.packages("treemap")
+library(treemap)
+
+
+#install.packages("corrplot")
+library(corrplot)
+
+#install.packages("cluster")
+library(cluster)
+
+
+#install.packages("factoextra")
+library(factoextra)
+
+#install.packages("knitr")
+library(knitr)
+
+#install.packages("igraph")
+library(igraph)
+
+#install.packages("ggraph")
+library(ggraph)
+
+#install.packages("tidygraph")
+library(tidygraph)
+
+
+#install.packages("reticulate")
+#install.packages("tensorflow")
+#install.packages("keras")
+library(reticulate)
+#reticulate::virtualenv_remove("r-tensorflow")
+library(keras)
+#keras::install_keras(method = "virtualenv", envname = "r-tensorflow")
+#reticulate::use_virtualenv("r-tensorflow", required = TRUE)
+library(keras)
+library(tensorflow)
+#reticulate::py_config()
+#tf$constant("Hello TensorFlow!")
+
+
+```
+# Introduction
+
+This report analyzes United Kingdom's international trade activity during 1995-2023 from CEPII BACI database data. The principal aim is to test whether future trade data—total trade, imports and exports, trade flows by partner country and product—can be predicted accurately using novel data-driven approaches. Through this, this document provides valuable answers to key questions: Will the overall trade volume of the UK increase or decrease over the next years? Which goods and trading partners are most likely to dominate future patterns of trade? And what are the difficulties of trying to predict long-term trade statistics?
+
+The original data set, containing more than 258 million observations of trade between 238 countries and 5,000 products, is trimmed to concentrate on the UK as importer and exporter. The process goes through four stages: data discovery and visualization, correlation analysis of trade variables, clustering to identify natural groupings between products and countries, and finally, deep learning models that have been trained to provide forecasts of future trade values. This systematic procedure not only allows for logical forecasting but also yields insights into the underlying forces driving UK trade.
+
+
+
+# Exploration and Visualisation
+
+
+
+
+```{r include=FALSE}
+## Data import and processing
+col_spec <- cols(
+  k = col_character(),  
+  t = col_double(),     
+  i = col_double(),
+  j = col_double(),
+  v = col_double(),
+  q = col_double()
+)
+
+files <- list.files(pattern = "*.csv")
+data_list <- lapply(files[1:29], function(file) {
+  read_csv(file, col_types = col_spec)
+})
+country_codes <- read_csv("codes/country_codes_V202501.csv")
+product_codes <- read_csv("codes/product_codes_HS92_V202501.csv")  
+
+rename_columns <- function(data) {
+  data <- data %>%
+    rename(
+      year = t,          # 't' to 'year'
+      exporter = i,      # 'i' to 'exporter'
+      importer = j,      # 'j' to 'importer'
+      product = k,       # 'k' to 'product'
+      value = v,         # 'v' to 'value'
+      quantity = q       # 'q' to 'quantity'
+    )
+  return(data)
+}
+
+data_list <- lapply(data_list, rename_columns)
+
+
+combined_data <- bind_rows(data_list)
+### 258605562 obs
+
+rm(data_list)
+gc()
+combined_data <- combined_data %>%
+  filter(exporter == "826" | importer == "826") 
+### 13367259 obs
+
+replace_country_codes <- function(data) {
+  data <- data %>%
+    mutate(exporter = as.character(exporter),
+           importer = as.character(importer)) %>%
+    
+    left_join(country_codes %>% 
+                mutate(country_code = as.character(country_code)) %>%  
+                select(country_code, country_name) %>% 
+                rename(exporter_name = country_name), 
+              by = c("exporter" = "country_code")) %>%
+    mutate(exporter = exporter_name) %>%
+    select(-exporter_name) %>%  
+    left_join(country_codes %>% 
+                mutate(country_code = as.character(country_code)) %>%  
+                select(country_code, country_name) %>% 
+                rename(importer_name = country_name), 
+              by = c("importer" = "country_code")) %>%
+    mutate(importer = importer_name) %>%
+    select(-importer_name)  
+
+  return(data)
+}
+
+combined_data <- replace_country_codes(combined_data)
+
+
+replace_product_codes <- function(data) {
+  data <- data %>%
+    mutate(product = as.character(product)) %>%
+    
+    left_join(product_codes %>% 
+                mutate(code = as.character(code)) %>%  
+                select(code, description),  
+              by = c("product" = "code")) %>%
+    
+    mutate(product = description) %>%
+    select(-description)  
+    
+  return(data)
+}
+
+combined_data <- replace_product_codes(combined_data)
+
+remove_description_from_product <- function(data) {
+  data <- data %>%
+    mutate(product = sub(":.*", "", product))  
+
+  return(data)
+}
+
+combined_data <- remove_description_from_product(combined_data)
+
+merge_petroleum_rows <- function(data) {
+  petroleum_data <- data %>%
+    filter(grepl("petroleum", product, ignore.case = TRUE)) %>%
+    group_by(year, exporter, importer) %>%
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      product = "Petroleum Products",  
+      .groups = "drop"
+    )
+  
+  # Now remove the original petroleum rows and add the merged row
+  data <- data %>%
+    filter(!grepl("petroleum", product, ignore.case = TRUE)) %>%
+    bind_rows(petroleum_data)
+  
+  return(data)
+}
+
+combined_data <- merge_petroleum_rows(combined_data)
+
+merge_rows_by_group <- function(data) {
+  data <- data %>%
+    group_by(year, exporter, importer, product) %>%
+    
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      .groups = "drop"
+    )
+    
+  return(data)
+}
+
+combined_data <- merge_rows_by_group(combined_data)
+### 4958186 obs
+
+uk_exporter_data <- combined_data %>%
+  filter(exporter == "United Kingdom")
+### 3385077 obs
+
+uk_importer_data <- combined_data %>%
+  filter(importer == "United Kingdom")
+### 1588878 obs
+
+importsum = sum(uk_importer_data$value)
+exportsum = sum(uk_exporter_data$value)
+
+# Clean up the environment, remove unnecessary variables
+rm(col_spec, files, country_codes, product_codes, rename_columns, replace_country_codes, remove_description_from_product, merge_petroleum_rows, merge_rows_by_group)
+gc()
+
+
+```
+
+Before any useful analysis can be performed, the raw trade data set must be processed into a usable form. The original data set, which was retrieved from the CEPII BACI database, includes over 258 million observations of international trade. To narrow the focus to the UK, all rows where the UK was either the importer or exporter were taken, reducing the data set to 13,367,259 observations.
+
+Trade goods are stated in the 6-digit level Harmonized System (HS), and countries utilize numeric codes. These were translated into human-readable tags for easier reading. Another region where simplification can be done at this stage is that a great many items were encountered that were part of unnecessary or overly disaggregated product categories. For instance, there were 21 distinct types of meats, 5 distinct product categories for eggs, and quite a few distinct coffee-related categories. These have been grouped together into more general product classes wherever it is possible.
+
+After consolidation and further cleaning, the dataset was reduced to 4,958,186 observations. The cleaned dataset represents approximately`r (4973955 / 258605562 * 100)`% of the original global dataset. 3,385,077 observations are UK exports, and 1,588,878 are UK imports.
+
+Though this would at first glance suggest that the UK exports more than it imports in terms of volume of transactions, the value of trade paints a different picture. The aggregate value of UK imports during this period is `r importsum`, whereas the aggregate value of exports is `r exportsum`, with a resultant overall trade balance of `r exportsum - importsum`.
+
+
+# Visualisation
+
+## Trade value over time
+
+Figure X shows United Kingdom's aggregate export, import, and net trade values during the period between 1995 and 2022. On the chart are export values marked in purple, import values shown in teal, and the yellow-colored net trade balance (subtracting imports from exports).
+
+Main Observations:
+Consistent growth with gaps
+Both export and import values grow consistently from 1995 to around 2008. The trend continues after the Global Financial Crisis but with ups and downs, specifically from 2010 to 2020.
+
+Persistent Trade Deficit:
+Imports are always greater than exports, as depicted by the teal line remaining above the purple line. The net trade line (yellow) is negative for the whole time period and depicts a steep downward trend, especially from 2015, showing a broadening trade deficit.
+
+Significant Economic Events
+In the period around 2008–2009, both imports and exports fall sharply as a result of the Global Financial Crisis. The same drop is seen in 2020 in the COVID-19 pandemic, with recovery shortly thereafter.
+
+Brexit Impact:
+After 2016, export growth seems to plateau while imports are relatively stable. This decoupling could be due to higher trade barriers or market uncertainty resulting from the UK's withdrawal from the European Union.
+
+Interpretation:
+The graph shows the UK's structural trade deficit over the last three decades. While integration with the world and economic rebound from repeated economic shocks have occurred, the enduring trade deficit and worsening net worth are a concern in terms of sustainability. As explained earlier, the widening gap can be reflective of growing dependence on imports, declining export competitiveness, or policy challenges caused by events such as Brexit. These patterns create important background for forecasting and fuel the need for predictive modeling further in this report.
+
+``` {r}
+combined_data %>%
+  filter(exporter == "United Kingdom" | importer == "United Kingdom") %>%
+  group_by(year) %>%
+  summarise(
+    export_value = sum(value[exporter == "United Kingdom"], na.rm = TRUE),
+    import_value = sum(value[importer == "United Kingdom"], na.rm = TRUE),
+    net_value = export_value - import_value,
+    .groups = "drop"  
+  ) %>%
+  gather(key = "type", value = "value", export_value, import_value, net_value) %>%
+  ggplot(aes(x = year, y = value, color = type)) +
+  geom_line(size = 1) +
+  scale_color_viridis(discrete = TRUE) +  
+  labs(title = "Export, Import, and Net Value Over Time", x = "Year", y = "Value") +
+  theme_minimal() +
+  theme(legend.title = element_blank())  
+```
+
+# Export Value by Top Importing Countries (1995–2022)
+Figure X is a stacked area chart that illustrates the value of UK exports to its top 10 importers between 1995 and 2022. Each color band is a different country and allows relative and absolute trends in exports to be visually discerned.
+
+Observations:
+Long-Term Rise with Periodic Shocks:
+UK exports experienced consistent growth between the mid-1990s and late 2000s, with peaks considerably in 2008, 2015, and also in 2021. Sharp declines in 2008–2009 and 2020 correspond to the Global Financial Crisis and the COVID-19 pandemic, respectively.
+
+USA and European dominance
+The US leads in exporting British goods by the largest proportion throughout the period, followed closely by other leading EU economies such as Germany, the Netherlands, and France. They are consistently rated as the best markets for British goods.
+
+Growing Role of Asia:
+Exports to China and Hong Kong SAR have grown steadily year on year, indicating a shift towards more participation in Asian economies. Although still less voluminous than those of the US or EU, it is proof of ongoing diversification in trade ties.
+
+Brexit Implications
+While exports to EU countries are strong, highly volatile after 2016. This might be because of Brexit-induced regulatory changes, supply chain reconfigurations, or new trade agreements affecting the UK's access to the European market.
+
+Interpretation
+This visualization emphasizes the UK's dependency on a small group of main trading partners and its success at gradually establishing new markets. Despite economic turmoil and political shifts such as Brexit, the UK export profile has remained strong, diversification acting as a buffer against external shocks. Continued growth within Asian markets and sustained performance within North America may be required to offset future troubles within Europe.
+
+``` {r}
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(year, importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_export_value))) %>%
+  filter(rank <= 10) %>%  
+  ungroup() %>%  
+  complete(year, importer, fill = list(total_export_value = 0)) %>%  
+  ggplot(aes(x = year, y = total_export_value, fill = importer)) +
+  geom_area(alpha = 0.6) +  
+  scale_fill_viridis(discrete = TRUE) +  
+  labs(title = "Export Value Over Time by Top 10 Importers", x = "Year", y = "Export Value") +
+  theme_minimal()
+```
+
+## Import value by top exporters
+
+Figure X is a stacked area chart showing the UK's value of imports from its top 10 trading partners between 1995 and 2022. There is one color band per country, enabling overall import trends as well as analysis per country contribution.
+
+Observations:
+Long-Term Increasing Trend:
+UK imports have risen exponentially during the past three decades, with sharp increases leading to peaks in 2008, 2015, and 2021. These turning points are generally aligned with world macroeconomic cycles.
+
+Dominance of USA and European Suppliers
+The United States is a consistent leader as a main exporter to the UK, with Germany, France, and the Netherlands ranking next. These countries form the mainstay of the UK import base, emphasizing strong transatlantic and intra-EU trade relationships.
+
+China's Increasing Influence:
+Chinese imports have grown exponentially, reflecting its emergence as the world's manufacturing hub. The phenomenon follows world trends and is the UK's increasing dependency on Asian supply chains.
+
+Sensitivity to Economic Shocks:
+The falls experienced about 2008 and 2020 coincide with the global financial crisis and the COVID-19 crisis, respectively. The falls indicate the sensitivity of UK imports to global external shocks.
+
+Post-Brexit Continuity:
+Despites political uncertainties, particularly post-Brexit, the UK's key EU trading partners have sustained strong export levels to the UK. This is possibly the resilience of pre-existing trade relations, even in the presence of regulatory adjustments.
+
+Interpretation:
+As previously described, UK trade patterns identify an increasingly global economy with ongoing reliance on a stable cluster of major trade partners. The continuity of sources of import—most importantly from Western Europe and North America—evinces established dependency within supply chains. Meanwhile, expanding Chinese presence marks ongoing structural adaptation in global trade. Such combined patterns serve to underscore the significance of trading strategies balancing each other in terms of ensuring stability in the face of future interruption.
+```{r}
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(year, exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_import_value))) %>%
+  filter(rank <= 10) %>%  
+  ungroup() %>%  
+  complete(year, exporter, fill = list(total_import_value = 0)) %>%
+  ggplot(aes(x = year, y = total_import_value, fill = exporter)) +
+  geom_area(alpha = 0.6) +  # Stacked area chart
+  scale_fill_viridis(discrete = TRUE) +  
+  labs(title = "Import Value Over Time by Top 10 Exporters", x = "Year", y = "Import Value") +
+  theme_minimal()
+```
+
+## export value by top products
+Figure X is a stacked area chart illustrating the export value of the UK's top 10 product categories from 1995 to 2022. This visualization facilitates comparison of dominant industrial sectors and their contribution to the UK export economy over nearly three decades.
+
+Key Observations:
+Long-Term Growth with Cyclical Peaks:
+Export values record overall growth in the period studied, with distinct peaks in 2008, 2015, and 2021. These are characteristic of economic cycles globally and signal that UK exports are closely aligned with global demand and the condition of international economies.
+
+Vehicles and Petroleum Products as Pillars
+Vehicles (yellow) have consistently represented the largest proportion of exports, fueled by the UK's robust automobile sector. Petroleum products have also been a major contributor, though more prone to volatility in demand and prices.
+
+Aerospace and Pharmaceuticals Growth:
+Medicaments and related products with aircraft (e.g., aircraft and spacecraft, turbo-jets) have shown steady growth, indicative of the UK's value-added, high-technology competitive advantage.
+
+Economic Shock Effect
+Sharp declines in export value near 2008 and 2020 correspond to the global financial crisis and the COVID-19 pandemic, respectively. These declines show the vulnerability of even robust export sectors to global disruptions.
+
+Post-Brexit Recovery:
+Even as the Brexit transition period brought uncertainty, the recovery in export values in 2021 and 2022 indicates initial recovery, possibly spurred by resumed global demand or trade realignments.
+
+Interpretation:
+As earlier mentioned, the UK's export structure relies heavily on a mix of high-technology manufacturing, pharmaceuticals, and energy products. Even though dominance by some groups such as vehicles will expose the trade balance to sectoral risks, the presence of diversified and strong sectors suggests the possibility of adapting and remaining stable. Monitoring such groups will be critical in monitoring developments in trade competitiveness and export resilience over time.
+
+```{r}
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(year, product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_export_value))) %>%
+  filter(rank <= 10) %>%  
+  ungroup() %>%  
+  complete(year, product, fill = list(total_export_value = 0)) %>%  
+  ggplot(aes(x = year, y = total_export_value, fill = product)) +
+  geom_area(alpha = 0.6) +  
+  scale_fill_viridis(discrete = TRUE) +  
+  labs(title = "Export Value Over Time by Top 10 Products", x = "Year", y = "Export Value") +
+  theme_minimal() 
+```
+
+
+## import value by top products
+
+Figure X presents a stacked area graph of the UK's top 10 imported product categories between 1995 and 2022, offering insight into the shifting structure of the UK's import economy over the last three decades.
+
+Key Observations:
+Steady Import Growth:
+The overall import value has increased considerably, with characteristic peaks circa 2008, 2015, and 2021. These fluctuations reflect both global economic conditions and shifting domestic demand.
+
+Aerospace and Machinery Dominance:
+Aircraft and other aeroplanes (purple), and data processing equipment and engines, consistently represent a significant proportion of total imports. These industries point to the UK's reliance on high-value industrial and technological imports from abroad.
+
+Rising Pharmaceutical and Chemical Imports:
+From the late 2010s, one can see a definite increase in the import value of medicaments and heterocyclic compounds. This likely reflects higher demand for medical and chemical products, possibly enhanced by the COVID-19 pandemic and rearrangement of healthcare supply chains.
+
+Steady Presence of Petroleum and Jet Engines:
+Imports of petroleum product and turbo-jets have remained relatively stable over the period. Despite their lower share, they still remain very important for energy and transport sectors. 
+
+Interpretation:
+As mentioned previously, the structure of UK trade specifies its dependence on foreign suppliers for high-value products—particularly those in aerospace, technological, and pharmaceutical sectors. This rising demand for high-technology imports may reflect the UK's shift towards a service economy, with high-value products imported from overseas to supply domestic industries.
+
+```{r}
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(year, product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_import_value))) %>%
+  filter(rank <= 10) %>%  
+  ungroup() %>%  
+  complete(year, product, fill = list(total_import_value = 0)) %>%  
+  ggplot(aes(x = year, y = total_import_value, fill = product)) +
+  geom_area(alpha = 0.6) +  
+  scale_fill_viridis(discrete = TRUE) +  
+  labs(title = "Import Value Over Time by Top 10 Products", x = "Year", y = "Import Value") +
+  theme_minimal() 
+```
+## Treemap of exports by product
+
+Figure X represents a treemap of the top 25 exports of the United Kingdom, offering a picture of the sectors composing the spine of the nation's international trade basket.
+
+Noteworthy Observations:
+Preponderance of Auto Sector:
+Motor cars possess the largest slice of space on the map, owing to their status as the most-valued UK export industry. It signals the automotive production bed within the nation which is highly entrenched and how well-developed this aspect is for the entire country economy. 
+
+Pharmaceutical and Energy Exports
+Medicaments are second, reflecting the growing world demand for pharmaceuticals produced in the UK. Petroleum products also represent a significant proportion, highlighting the UK's ongoing dominance in energy production and supply.
+
+Industrial and Aerospace Capabilities:
+Aircraft and spacecraft, engines, turbines, and metals all feature prominently, highlighting the UK's high-tech manufacturing capability and role in world industrial supply chains.
+
+Specialised and High-Tech Goods:
+Exports such as whiskies, turbo-jets, heterocyclic compounds, and data processing machinery highlight the competitive edge of the UK in niche markets, particularly chemicals, aviation, and information technology.
+As previously observed, the UK export economy is diversified and positionally positioned in high-value, innovation-driven industries. The treemap shows how industries such as motor, pharmaceuticals, energy, and aerospace are pillar industries of export resilience. Such diversification in products could confer immunity from sector-specific declines and world shocks.
+
+```{r}
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_export_value) %>%  
+  treemap(
+    dtf = .,  
+    index = c("product"), 
+    vSize = "total_export_value",  
+    vColor = "total_export_value",  
+    draw = TRUE,
+    title = "Top 25 UK Export Products"
+  )
+
+```
+## Top 25 UK Import Products
+
+A treemap of the United Kingdom's top 25 import commodities is presented in Figure X to give insight into the leading sectors driving demand for international goods.
+
+Key Findings:
+Automotive and Energy Dependence:
+Vehicles form the greatest percentage of UK imports, indicating the nation's continued reliance on overseas auto manufacturers. Petroleum goods also make up a significant percentage, indicating the UK's reliance on overseas energy sources considering local production.
+
+Industrial and Technological Needs:
+Metals, oil, and machinery are the principal contributors, a reflection of UK industry's raw materials and capital goods needs. Moreover, commodities such as data processing equipment, electronic circuits, and transmission apparatus demonstrate the crucial role of technology and infrastructure-related imports.
+
+Pharmaceuticals and Aerospace:
+Medicines have high import value, in line with export-side value of pharmaceuticals and reflecting world supply chain interdependence. Aircraft, engines, and turbines contribute to the presence of the aerospace industry on both sides of UK trade as well.
+
+Consumer Goods:
+Imports such as wine, footwear, and food preparations reflect strong consumer demand and lifestyle-led importation. These products sustain a heterogeneous home market with international goods.
+As noted before, the UK boasts a diversified and extensive trade landscape. Its import landscape is shaped by both industrial inputs as well as technologically sophisticated elements, alongside traditional consumer goods. This not only reflects a vigorous global interdependency but also draws attention to Britain's vulnerability in the face of global supply networks in key industries such as vehicles, drugs, and manufacturing.
+
+
+```{r}
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_import_value) %>% 
+  treemap(
+    dtf = .,  
+    index = c("product"),  
+    vSize = "total_import_value",  
+    vColor = "total_import_value",  
+    draw = TRUE,
+    title = "Top 25 UK Import Products"
+  )
+```
+
+## treemap of exports by importer
+
+Figure X illustrates the top 25 countries for UK export destinations, giving a complete picture of the nation's most significant trade partners.
+
+Key Observations:
+Dominant Partners:
+USA and Germany were the two largest export markets, reflecting established trade relationships with the UK. They are followed closely by large EU economies like France, Netherlands, Ireland, and Belgium, affirming the continued relevance of Europe despite post-Brexit realignments.
+
+EU and Non-EU Balance:
+A considerable proportion of the top destinations remains in the EU, however, but other non-EU destinations such as China, United Arab Emirates, Australia, and Japan are also highly ranked, reflecting effective diversification of trade outside the EU market.
+
+Emerging Markets:
+India, Turkey, and South Korea are considered emerging or growing trade partners, reflecting the UK's shift to high-growth markets in the Middle East and Asia.
+As mentioned above, the UK possesses a very diversified export profile. Despite classical Western economies dominating in terms of value, the fact that emerging markets are represented in the top 25 shows that the UK is gradually rebalancing its export policy. This shift could be based on evolving world demand, changing post-Brexit trade arrangements, or deliberate policy measures to diversify overseas.
+
+```{r}
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_export_value) %>%  
+  treemap(
+    dtf = .,  
+    index = c("importer"),  # Group by importer (destination country)
+    vSize = "total_export_value", 
+    vColor = "total_export_value",  
+    draw = TRUE,
+    title = "Top 25 UK Export Destinations"
+  )
+```
+
+## treemap of exports by importer
+
+Figure X lists the UK's top 25 import-supplying nations, giving an indication of the country's most significant sources of imports.
+
+Key Points:
+
+Major Suppliers:
+Germany and China are the UK's most significant sources of imports, reflecting their central role in supplying industrial inputs, machinery, and electronics. The USA and the Netherlands also feature, reflecting close transatlantic relationships and logistics trade flows across Europe.
+
+EU and International Balance:
+A high percentage of major import partners are members of the EU, including France, Belgium, Italy, and Ireland, indicating the UK's increasing integration with European supply chains. However, the huge contributions from non-members of the EU like Japan, South Korea, and India indicate a global sourcing strategy that is extended. 
+
+Diversified Supply Chain:
+That countries like Switzerland, Norway, Turkey, and the Russian Federation are also represented only goes to underscore the UK's reliance on a broad geographical spectrum of suppliers for sectors like pharmaceuticals, raw materials, and energy.
+
+Interpretation:
+As indicated heretofore, the UK's trade profile exhibits an extremely diversified structure. On the imports front, such diversification ensures immunity to global disruptions or regional trade tensions across the world. That it now has both traditional European partners and new Asian suppliers is a reflection of the fact that the UK is actively redesigning its import policies to reflect the demands of a post-Brexit, globalized world.
+```{r}
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_import_value) %>% 
+  treemap(
+    dtf = .,  
+    index = c("exporter"), 
+    vSize = "total_import_value", 
+    vColor = "total_import_value",  
+    draw = TRUE,
+    title = "Top 25 UK Import Sources"
+  )
+```
+## Top 5 Goods Exported, and who they are exported to
+
+Figure X illustrates the top 5 products exported by the UK to each of its top 5 importing countries, offering a detailed view of bilateral trade flows and the specific products that are powering export relationships.
+
+Key Observations:
+
+Vehicles Dominate:
+Vehicles are the most exported product by far, especially to the USA and Germany, followed by Belgium, China, and France. This reflects the central role played by the UK's automotive industry in international trade.
+
+Energy and Industrial Exports:
+Oils and petroleum products also feature strongly, with large exports to Germany, the USA, the Netherlands, and Ireland. These help to highlight the importance of the UK's energy sector and industrial base in its export basket.
+
+Pharmaceutical and Metal Exports:
+Medicaments are concentrated in exports to the USA and Germany, indicating high demand for pharmaceuticals. Metals, however, are heavily directed to Switzerland, perhaps as a world trading or refining hub, and other Asian and Western economies. 
+
+Interpretation:
+This chart confirms the UK's reliance on a relatively small group of high-value products, such as vehicles, petroleum, and pharmaceuticals, in exports to its principal partners. As indicated earlier, while there is geographic diversification, concentration in a small number of product categories can expose UK exports to sector-specific weakness and shifting global demand.
+```{r}
+top_export_goods <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(5, total_export_value)
+
+combined_data %>%
+  filter(exporter == "United Kingdom" & product %in% top_export_goods$product) %>%
+  group_by(product, importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(product) %>%
+  top_n(5, total_export_value) %>%
+  ggplot(aes(x = reorder(importer, total_export_value), y = total_export_value, fill = importer)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~product, scales = "free_y") +
+  labs(title = "Top 5 Goods We Export to the Top 5 Importers",
+       x = "Importer Country", y = "Total Export Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Top 5 imported goods, and who they are imported from
+
+Figure X also illustrates the UK's top 5 imports from its top 5 exporting countries, giving detailed insight into what underpins inbound trade volumes.
+
+Key Findings:
+
+Vehicles as Central Imports:
+Vehicles are the biggest import category, headed by Germany, with major contributions also from Belgium, Japan, Spain, and France. This highlights the UK's heavy dependence on European car manufacturing.
+
+Energy Dependence:
+Petroleum products and oils are important imports. Norway is the leading supplier in both categories, followed by the USA, Russian Federation, and some Middle Eastern and African countries. This reflects the UK's global sourcing strategy for key energy resources.
+
+Raw Materials and Industrial Inputs
+Metals arrive in from a wide range of geographical areas like North America (USA, Canada), Africa (South Africa), and Europe (Switzerland, Russia), highlighting the geographic diversity of key industrial goods.
+
+Explanation:
+As previously discussed, the UK follows a very internationalized pattern of imports with strong dependences across industries like energy, cars, and metals. The visualization above reinforces the importance of maintaining geopolitical and trading relations stable so as to continue supplying key commodities smoothly.
+```{r}
+top_import_goods <- combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(5, total_import_value)
+
+combined_data %>%
+  filter(importer == "United Kingdom" & product %in% top_import_goods$product) %>%
+  group_by(product, exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(product) %>%
+  top_n(5, total_import_value) %>%
+  ggplot(aes(x = reorder(exporter, total_import_value), y = total_import_value, fill = exporter)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~product, scales = "free_y") +
+  labs(title = "Top 5 imported goods for the top 5 exporters",
+       x = "Exporter Country", y = "Total Import Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# correlations
+## Correlation Between Top Export Products
+
+Figure X is a correlation matrix of the UK's top-selling export products, and it is a hint at how various industries behave together in their trends over time. The darker the circle, the higher the positive correlation of two product groups.
+
+Key Points:
+
+Industrial Grouping:
+There are high correlations between products within the automobile and aerospace sectors—i.e., vehicles, engines, and aircraft and spacecraft. This means that trade performances of these sectors are strongly interdependent, likely due to shared supply chains, similar technology, or synchronized global demand cycles.
+
+Raw Material Dependencies:
+Metals and petroleum products also have high correlations, perhaps due to their central role in various industries. They are generally utilized as inputs for manufacturing, construction, and energy generation, and as such, their export patterns have a tendency to move together.
+
+Pharmaceutical Linkages:
+Medicaments have a moderate correlation with metals and petroleum, indicating upstream material dependencies or correlated market conditions, e.g., health care demands during global crises.
+
+Mixed Signals in Niche Categories
+Other products such as turbines, plastics, and oils have weaker and more varied correlations, implying that these goods are more likely to respond independently to world market trends, regulatory changes, or industry-specific patterns.
+This knowledge is critical for policy-makers and trade analysts, for it reveals industrial sectors expected to be affected concurrently by economic changes. For forecasting, interdependence can improve the accuracy of models by allowing the application of product groupings with common behavior patterns.
+```{r}
+top_10_export_products_aggregated <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_export_value)) %>%
+  top_n(10, total_export_value)
+
+top_10_export_product_data_agg <- combined_data %>%
+  filter(exporter == "United Kingdom" & product %in% top_10_export_products_aggregated$product) %>%
+  group_by(year, product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = product, value = total_value)
+
+export_correlation_matrix <- cor(top_10_export_product_data_agg[, -1], use = "complete.obs")
+
+corrplot(export_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+
+```
+## Correlation Between Top Import Products
+
+Figure X displays a correlation matrix of the top import products of the UK, providing us with an insight into how volumes in different industries trend against one another.
+
+Observations:
+
+Technology & Automotive Synergy:
+Strong positive correlations among cars, transmission equipment, and plastics exist, which reflect the interconnectedness of the auto and electronics supply chains. The products often share some components or processes, and as a result, their import patterns increase and decrease together.
+
+Industrial Dependencies
+Metals and petroleum products are highly correlated, validating their status as key inputs for a wide range of industrial applications, including construction, production, and energy.
+
+Sector-Specific Import Patterns:
+Medicaments and data processing equipment are less correlated with other imports, suggesting that their volumes of trade are influenced more by sector-specific demand—like health needs or technology cycles—than broader economic fluctuations. 
+
+Divergent Movements:
+Negative or weaker correlations reflect that certain products may exhibit trade-off behavior—for example, increases in one category of imports can be paired with reductions in another, perhaps because of shifts in domestic production, policy, or foreign supply shocks.
+
+Interpretation:
+This correlation matrix emphasizes the importance of recognizing interdependencies and independencies among UK imports. In policy planning and forecasting, being aware of which industries move together (or diverge) can enhance the credibility of projections and inform strategies for managing supply chain vulnerabilities.
+
+
+```{r}
+top_10_import_products_aggregated <- combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_import_value)) %>%
+  top_n(10, total_import_value)
+
+top_10_import_product_data_agg <- combined_data %>%
+  filter(importer == "United Kingdom" & product %in% top_10_import_products_aggregated$product) %>%
+  group_by(year, product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = product, value = total_value)
+
+import_correlation_matrix <- cor(top_10_import_product_data_agg[, -1], use = "complete.obs")
+
+corrplot(import_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+```
+## Correlation Between UK Export Destinations (Importers of UK Goods)
+Figure X illustrates the correlation matrix of the top importing nations for UK products, and it indicates the extent to which export volume to these nations has progressed in relation to each other.
+
+Key Findings:
+
+Strong Regional Clustering:
+There is a clear grouping of European countries—Germany, France, Netherlands, Belgium, and Ireland—that maintain consistently high positive correlations. This reflects synchronized patterns of trade demands, which are most likely brought about by proximity, economic linkage, and similar trade agreements (e.g., historical EU membership).
+
+USA and Switzerland:
+The USA also shows relatively high correlations with European allies, particularly Germany and Netherlands, reflecting similar and stable demand for UK exports. Switzerland, while a significant destination, shows a slightly lower correlation pattern, reflecting more independent demand cycles.
+
+China and Italy – Divergent Patterns:
+China is also demonstrating a relatively weaker and even slightly reverse correlation with countries like Italy, suggesting that UK exports to China follow a divergent trend, perhaps driven by sector-specific or geopolitical rather than regional economic concerns.
+
+Interpretation
+As commented above, the UK's export base is regionally based in Europe, with high inter-country correlation across EU members. However, the inclusion of USA and China, whose behavior is less synchronized, gives validity to the argument that the UK has a diversified export strategy combining regional consistency with global reach. These correlation dynamics are vital when considering the stability and volatility of future trade flows.
+
+
+```{r}
+top_10_importers_aggregated <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(importer) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_import_value)) %>%
+  top_n(10, total_import_value)
+
+top_10_importer_data_agg <- combined_data %>%
+  filter(exporter == "United Kingdom" & importer %in% top_10_importers_aggregated$importer) %>%
+  group_by(year, importer) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = importer, value = total_value)
+
+importer_correlation_matrix <- cor(top_10_importer_data_agg[, -1], use = "complete.obs")
+
+corrplot(importer_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+```
+# Correlation Between UK Import Sources (Exporters to the UK)
+
+Figure X presents the correlation matrix of the top UK export partner nations, providing a sense of how closely their trade volumes move in tandem over time.
+
+Key Observations:
+
+Strong Co-Movement Among European Partners:
+Major European exporters — including Germany, France, Netherlands, Ireland, Italy, and Belgium — are all highly positively correlated with one another. This is a reflection of the region's integrated supply chains and synchronized economic cycles, with trade volumes to the UK rising and falling together in tandem.
+
+USA and China:
+Although still positively linked with the European countries, the USA and China are somewhat more independently inclined, possibly indicating differences in trade structure, product clusters, or policy determinants outside. Their inclusion is a measure of the UK's reliance on suppliers across the world, outside its immediate sphere.
+
+Norway's Special Role:
+Norway exhibits high synchronization with its main European trading partners, but its importance likely differs by product (e.g., energy products like oil and gas), which creates minor divergences in the timing of its trade compared to more diversified exporters.
+
+Interpretation:
+As noted earlier, the UK has close trade integration with Europe, reflected in the strongly correlated trade flows within EU members. Meanwhile, countries such as China, USA, and Norway impart diversity to the UK's import base, providing resilience to regional disruption. The co-movements are instructive on both the commonalities of economic dependencies as well as vulnerabilities in the UK's import network.
+
+```{r}
+top_10_exporters_aggregated <- combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(exporter) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_export_value)) %>%
+  top_n(10, total_export_value)
+
+top_10_exporter_data_agg <- combined_data %>%
+  filter(importer == "United Kingdom" & exporter %in% top_10_exporters_aggregated$exporter) %>%
+  group_by(year, exporter) %>%
+  summarise(total_value = sum(value, na.rm = TRUE)) %>%
+  spread(key = exporter, value = total_value)
+
+exporter_correlation_matrix <- cor(top_10_exporter_data_agg[, -1], use = "complete.obs")
+
+corrplot(exporter_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+```
+
+```{r include=FALSE}
+##removing all unused data from the enviroment to save on ram
+
+rm(list = setdiff(ls(), c("combined_data")))
+gc()
+```
+# clustering
+
+```{r}
+# UK as Importer
+uk_import_data <- combined_data %>%
+  filter(importer == "United Kingdom")
+
+# UK as Exporter
+uk_export_data <- combined_data %>%
+  filter(exporter == "United Kingdom")
+
+# Top 20 exporters to UK
+top_exporters <- uk_import_data %>%
+  group_by(exporter) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(exporter)
+
+# Top 20 import products
+top_import_products <- uk_import_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(product)
+
+# Top 20 importers from UK
+top_importers <- uk_export_data %>%
+  group_by(importer) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(importer)
+
+# Top 20 export products
+top_export_products <- uk_export_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(20, total_value) %>%
+  pull(product)
+
+exporter_matrix <- uk_import_data %>%
+  filter(exporter %in% top_exporters) %>%
+  group_by(exporter, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+exporter_data <- exporter_matrix %>% select(-exporter)
+
+set.seed(42)
+exporter_clusters <- kmeans(exporter_data, centers = 4)
+
+exporter_cluster_result <- exporter_matrix %>%
+  mutate(cluster = exporter_clusters$cluster)
+
+import_product_matrix <- uk_import_data %>%
+  filter(product %in% top_import_products) %>%
+  group_by(product, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+import_product_data <- import_product_matrix %>% select(-product)
+
+set.seed(42)
+import_product_clusters <- kmeans(import_product_data, centers = 4)
+
+import_product_cluster_result <- import_product_matrix %>%
+  mutate(cluster = import_product_clusters$cluster)
+
+importer_matrix <- uk_export_data %>%
+  filter(importer %in% top_importers) %>%
+  group_by(importer, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+importer_data <- importer_matrix %>% select(-importer)
+
+set.seed(42)
+importer_clusters <- kmeans(importer_data, centers = 4)
+
+importer_cluster_result <- importer_matrix %>%
+  mutate(cluster = importer_clusters$cluster)
+
+export_product_matrix <- uk_export_data %>%
+  filter(product %in% top_export_products) %>%
+  group_by(product, year) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = year, values_from = total_value, values_fill = 0)
+
+export_product_data <- export_product_matrix %>% select(-product)
+
+set.seed(42)
+export_product_clusters <- kmeans(export_product_data, centers = 4)
+
+export_product_cluster_result <- export_product_matrix %>%
+  mutate(cluster = export_product_clusters$cluster)
+
+
+##Visulasation
+# Visualization for UK as Importer - Product Cluster
+product_names_import <- import_product_cluster_result$product
+product_values_import <- import_product_cluster_result %>%
+  select(-product, -cluster) %>%
+  as.matrix()
+rownames(product_values_import) <- product_names_import
+
+cor_matrix_import <- cor(t(product_values_import), use = "pairwise.complete.obs")
+cor_edges_import <- which(upper.tri(cor_matrix_import) & cor_matrix_import > 0.8, arr.ind = TRUE)
+edge_list_import <- data.frame(
+  from = rownames(cor_matrix_import)[cor_edges_import[, 1]],
+  to = rownames(cor_matrix_import)[cor_edges_import[, 2]]
+)
+
+node_info_import <- import_product_cluster_result %>%
+  mutate(name = product,
+         total_value = rowSums(select(., -product, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_import <- graph_from_data_frame(d = edge_list_import, vertices = node_info_import, directed = FALSE)
+
+# Visualization for UK as Exporter - Product Cluster
+product_names_export <- export_product_cluster_result$product
+product_values_export <- export_product_cluster_result %>%
+  select(-product, -cluster) %>%
+  as.matrix()
+rownames(product_values_export) <- product_names_export
+
+cor_matrix_export <- cor(t(product_values_export), use = "pairwise.complete.obs")
+cor_edges_export <- which(upper.tri(cor_matrix_export) & cor_matrix_export > 0.8, arr.ind = TRUE)
+edge_list_export <- data.frame(
+  from = rownames(cor_matrix_export)[cor_edges_export[, 1]],
+  to = rownames(cor_matrix_export)[cor_edges_export[, 2]]
+)
+
+node_info_export <- export_product_cluster_result %>%
+  mutate(name = product,
+         total_value = rowSums(select(., -product, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_export <- graph_from_data_frame(d = edge_list_export, vertices = node_info_export, directed = FALSE)
+
+# Visualization for UK as Importer - Exporter Cluster
+exporter_names_import <- exporter_cluster_result$exporter
+exporter_values_import <- exporter_cluster_result %>%
+  select(-exporter, -cluster) %>%
+  as.matrix()
+rownames(exporter_values_import) <- exporter_names_import
+
+cor_matrix_exporter_import <- cor(t(exporter_values_import), use = "pairwise.complete.obs")
+cor_edges_exporter_import <- which(upper.tri(cor_matrix_exporter_import) & cor_matrix_exporter_import > 0.8, arr.ind = TRUE)
+edge_list_exporter_import <- data.frame(
+  from = rownames(cor_matrix_exporter_import)[cor_edges_exporter_import[, 1]],
+  to = rownames(cor_matrix_exporter_import)[cor_edges_exporter_import[, 2]]
+)
+
+node_info_exporter_import <- exporter_cluster_result %>%
+  mutate(name = exporter,
+         total_value = rowSums(select(., -exporter, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_exporter_import <- graph_from_data_frame(d = edge_list_exporter_import, vertices = node_info_exporter_import, directed = FALSE)
+
+# Visualization for UK as Exporter - Importer Cluster
+importer_names_export <- importer_cluster_result$importer
+importer_values_export <- importer_cluster_result %>%
+  select(-importer, -cluster) %>%
+  as.matrix()
+rownames(importer_values_export) <- importer_names_export
+
+cor_matrix_importer_export <- cor(t(importer_values_export), use = "pairwise.complete.obs")
+cor_edges_importer_export <- which(upper.tri(cor_matrix_importer_export) & cor_matrix_importer_export > 0.8, arr.ind = TRUE)
+edge_list_importer_export <- data.frame(
+  from = rownames(cor_matrix_importer_export)[cor_edges_importer_export[, 1]],
+  to = rownames(cor_matrix_importer_export)[cor_edges_importer_export[, 2]]
+)
+
+node_info_importer_export <- importer_cluster_result %>%
+  mutate(name = importer,
+         total_value = rowSums(select(., -importer, -cluster), na.rm = TRUE)) %>%
+  select(name, cluster, total_value)
+
+graph_importer_export <- graph_from_data_frame(d = edge_list_importer_export, vertices = node_info_importer_export, directed = FALSE)
+
+```
+
+
+## Product Clustering – UK Imports
+
+Figure X shows the United Kingdom's clustered import products network, divided by trade similarity and import value. By applying a graph-based clustering algorithm to correlation-weighted trade data, products have been grouped into four clusters. Nodes represent products, with node size indicating total import value and color showing cluster membership.
+
+Cluster 1 (red) is more sparse with some highly specialized products such as metals, which have unique import profiles with minimal relationship to other clusters. Cluster 2 (green) is more dispersed with a broad array of less correlated products such as aeroplanes, diamonds, and data processing equipment—indicative of various sourcing strategies or market demands. Cluster 3 (cyan) is a highly connected, dense core formed by staple imports such as oils, petroleum products, plastics, and medicaments, which are essential to UK health and industry. Cluster 4 (purple) is centered on vehicles and extremely closely related components like engines, rubber, and steel, suggesting close internal trade relationships within the automotive supply chain.
+
+Overall, this clustering reveals coherent structure in UK imports, dividing out closely related groups of products and more independent classes. These patterns can guide strategic planning and provide a crucial foundation for predictive models by highlighting areas of common economic activity.
+
+```{r}
+ggraph(graph_import, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(title = "Product Clusters - UK Imports", color = "Cluster", size = "Total Value")
+```
+## Product Clustering – UK Exports
+Figure X illustrates the cluster network of UK export products, grouped by similarity in trade and overall export value. Four clusters resulted from a graph-based algorithm run over correlation-weighted exports. Similar to the imports chart, products are represented as nodes within this graph, total export value is represented by the size of nodes, and color indicates its corresponding cluster.
+
+Cluster 1 (red) consists of a dense center of highly related products including plastics, whiskies, aircraft and spacecraft, machinery, and engines. The categories are highly interrelated and central to the UK's manufacturing and industrial export foundation. Cluster 2 (green) is more dispersed and consists of less related products including rubber, machines, and transmission apparatus—suggesting diverse sources of production and demand patterns. Cluster 3 (cyan) contains fewer significant exports like petroleum products, metals, and medicaments, which are typically pharma-related or resource-based. Cluster 4 (purple) is dominated by vehicles with strong connections to priority components like iron or steel, supporting the integrated supply chain of the automotive sector.
+
+This grouping uncovers structural characteristics in the UK exporting economy, facilitating differentiation between closely interrelated industrial groups and more independent export groups. These insights are notably relevant for downstream predictive modeling, as they provide information on the interrelationship and dependence amongst goods exported.
+
+```{r}
+# Plot for UK as Exporter - Product Cluster
+ggraph(graph_export, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(title = "Product Clusters - UK Exports", color = "Cluster", size = "Total Value")
+```
+## Exporter Clustering – UK Imports
+
+Figure X shows the export country network to the UK, with countries grouped into clusters as a function of trade pattern similarity and overall import value. The clustering is from a correlation-weighted trade data graph with nodes being countries and edges being trade similarity. Node size is the overall import value from the country, with colors indicating cluster membership.
+
+Cluster 1 (red) includes countries such as Switzerland, Canada, the Russian Federation, and Japan—relatively less integrated and more independent in their trade ties with the UK. Such exporters specialize in exporting high-value or specialized goods outside the UK's principal European trade web. Cluster 2 (green) revolves around Germany, Ireland, and Italy, forming a highly integrated set of major EU trading partners with high, stable trade flows. Cluster 3 (cyan) includes France, China, and the USA, which signifies a mix of regional and international exporters that export diversified products to the UK. Cluster 4 (purple) connects Belgium, Spain, and Poland, which signifies tight intra-European interdependency on trade.
+
+This exporter clustering is a focus of geographical and structural UK trade dependencies. It provides a comparison between international suppliers of varying profiles and highly interdependent European trade bloc—a fascinating element for future forecasting trade flow and simulating import behavior.
+
+```{r}
+# Plot for UK as Importer - Exporter Cluster
+ggraph(graph_exporter_import, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(title = "Exporter Clusters - UK Imports", color = "Cluster", size = "Total Value")
+```
+## Importer Clustering – UK Exports
+Figure X is the UK's export destination network, aggregated by similarity of import behavior and total export value. Every node is a nation that imports from the UK, with node size indicating total export value and colors mapping different clusters from a graph-based algorithm applied to correlation-weighted data.
+
+Cluster 1 (red) is very distinct importers such as Switzerland and China who maybe have specific trade patterns or specialist requirements. Cluster 2 (green) has all the major European partners such as Belgium, Ireland, and France and also Canada and India, with this capturing heavy and consistent patterns of trade to/from the UK. Cluster 3 (cyan) is defined by a heterogenous set of countries like the Netherlands, Australia, Poland, and Japan, reflecting heterogenous but moderately comparable import behaviors. Cluster 4 (purple) connects high-value destinations like Germany and the USA, reflecting their central role in the UK's export strategy to the world.
+
+This clustering sheds light on how different countries interact with British exports, mapping closely aligned regional trade blocks alongside more world-wide dispersed partners. It is potentially valuable as context for classification and prediction issues in the deep learning phase where country-level tendencies can enhance performance.
+
+
+```{r}
+# Plot for UK as Exporter - Importer Cluster
+ggraph(graph_importer_export, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(size = total_value, color = factor(cluster))) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  labs(title = "Importer Clusters - UK Exports", color = "Cluster", size = "Total Value")
+```
+Product and trade partner clustering analysis shows latent structure in the UK trade network, separating between central industrial products, regionally integrated economies, and outlier specialists. Not only do the patterns offer economic intuition, but also they inform feature engineering of deep learning models. With clustering, capturing product- and country-level similarities, the predictive model better generalizes trade behavior and long-term predictions in trade value more accurate and reliable.
+
+
+
+```{r include=FALSE}
+#clenaing enviroment 
+rm(list = setdiff(ls(), c("combined_data")))
+gc()
+```
+
+# deep learning
+
+## Methods
+
+Two deep learning models were created to forecast UK trade values, one for when the United Kingdom is an importer and one for when it is an exporter. These models were implemented using the Keras API in TensorFlow (version 2.10.0) under the R environment. To prepare the data for modeling, all trade transactions worth less than 5,000 were removed in an effort to reduce noise and prevent the likelihood of overfitting. Categorical columns such as trade partners and product types were embedded to integers and passed through embedding layers to learn their internal representation. Numerical features such as trade year and trade value were normalized to have zero mean and unit variance.
+
+Both models were trained using 30 epochs and a batch size of 216, selected after trying different combinations of hyperparameters. This configuration provided consistent stable performance and avoided convergence issues associated with larger or smaller batch sizes. Mixed precision training (with the mixed_float16 policy) was also enabled to improve training efficiency without sacrificing numerical accuracy.
+
+The loss function used was mean squared error (MSE), with mean absolute error (MAE) tracked as a secondary performance measure. A validation split of 20% was used in training, and shuffling was enabled to aid generalization. Model performance was monitored while training via training history plots. Both models displayed steady convergence and minimal divergence between training and validation error curves, indicating high generalization and no overfitting evidence
+
+
+
+```{r}
+policy <- tf$keras$mixed_precision$Policy("mixed_float16")
+combined_data_dl <- combined_data %>%
+  select(-quantity)
+
+# Filter data for UK Exporter
+uk_export_data <- combined_data_dl %>%
+  filter(exporter == "United Kingdom") %>%
+  mutate(
+    importer = as.integer(factor(importer)),  # Integer encoding for importer
+    product = as.integer(factor(product))     # Integer encoding for product
+  ) %>%
+  filter(!is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+
+# Filter data for UK Importer
+uk_import_data <- combined_data_dl %>%
+  filter(importer == "United Kingdom") %>%
+  mutate(
+    exporter = as.integer(factor(exporter)),  # Integer encoding for exporter
+    product = as.integer(factor(product))     # Integer encoding for product
+  ) %>%
+  filter(!is.na(exporter) & !is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+
+exporter_levels <- levels(factor(combined_data$exporter))
+importer_levels <- levels(factor(combined_data$importer))
+
+
+product_levels <- levels(factor(combined_data$product))
+
+# Normalize numerical columns (value, year)
+uk_export_data <- uk_export_data %>%
+  mutate(
+    value = scale(value),
+    year = scale(year)
+  )
+
+uk_import_data <- uk_import_data %>%
+  mutate(
+    value = scale(value),
+    year = scale(year)
+  )
+
+# Prepare features (X) and target (y) for predictions
+X_exporter <- uk_export_data %>% select(-value,-exporter)
+y_exporter <- uk_export_data$value
+
+
+
+X_importer <- uk_import_data %>% select(-value,-importer)
+y_importer <- uk_import_data$value
+
+# Model for UK as Exporter (with embeddings for categorical variables)
+importer_input <- layer_input(shape = 1, name = "importer_input")
+product_input <- layer_input(shape = 1, name = "product_input")
+
+importer_embedding <- importer_input %>%
+  layer_embedding(input_dim = length(unique(X_exporter$importer)) + 1, output_dim = 10)
+
+product_embedding <- product_input %>%
+  layer_embedding(input_dim = length(unique(X_exporter$product)) + 1, output_dim = 10)
+
+importer_embedding_flat <- importer_embedding %>% layer_flatten()
+product_embedding_flat <- product_embedding %>% layer_flatten()
+
+numeric_input <- layer_input(shape = ncol(X_exporter) - 2, name = "numeric_input")  # Exclude 'importer' and 'product'
+
+concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
+
+# Add Dense layers for processing
+dense_layer <- concatenated %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, dtype = "float32")  # ✅ Ensures correct output type
+
+
+exporter_model <- keras_model(
+  inputs = list(importer_input, product_input, numeric_input),
+  outputs = dense_layer
+)
+
+# Compile the model
+exporter_model %>% compile(
+  loss = "mse",  # Mean Squared Error loss function for regression
+  optimizer = optimizer_adam(),
+  metrics = c("mae")  # Mean Absolute Error for evaluation
+)
+
+# Prepare the data for training
+
+importer_input_data <- as.integer(X_exporter$importer)
+product_input_data <- as.integer(X_exporter$product)
+
+numeric_input_data <- X_exporter %>%
+  select(-importer, -product) %>%
+  as.matrix()  # Ensure it’s numeric and in matrix form
+
+
+y_exporter <- as.numeric(y_exporter)
+
+
+
+```
+
+# Training
+## Exporter Model Training Performance
+ 
+
+Figure X illustrates the training history of the exporter model over 30 epochs, loss (top panel) and mean absolute error (MAE, bottom panel) on the training and validation sets.
+
+Loss (Top Plot):
+The training loss is gradually diminishing, which is a promise that the model is actually learning from the data. Validation loss also exhibits the same pattern but begins to plateau at epoch 20, indicating that the model is getting close to its optimal capacity to generalize from the training set. Most significantly, there is no significant divergence of training and validation loss, indicating little likelihood of overfitting.
+
+MAE (Bottom Plot):
+MAE training decreases consistently, falling below 0.05 by the final epoch. Although the validation MAE is more prone to fluctuations, it stabilizes after around 10 epochs and is fairly close to the training curve. These minor fluctuations are to be expected with the actual data and indicate no model instability.
+
+Overall, the training curves reflect good model performance with good convergence. Training and validation stability leans towards good model generalization to future data and absence of overfitting, and therefore trustworthiness for future predictions.
+
+
+
+
+```{r include=FALSE}
+# Train the UK Exporter model
+exporter_history <- exporter_model %>% fit(
+  x = list(
+    importer_input = importer_input_data,
+    product_input = product_input_data,
+    numeric_input = numeric_input_data
+  ),
+  y = y_exporter,
+  epochs = 30,
+  batch_size = 216,
+  validation_split = 0.2,
+  shuffle = TRUE  # ✅ Add this
+)
+plot(exporter_history) + ggtitle("Exporter Model Training History")
+```
+```{include=FALSE}
+plot(exporter_history) + ggtitle("Exporter Model Training History")
+```
+
+```{r include=FALSE}
+# ----------------------------------------
+# Model for UK as Importer (with embeddings for categorical variables)
+# ----------------------------------------
+
+# Model for UK as Importer (similar to Exporter)
+importer_input <- layer_input(shape = 1, name = "importer_input")
+product_input <- layer_input(shape = 1, name = "product_input")
+
+importer_embedding <- importer_input %>%
+  layer_embedding(input_dim = length(unique(X_importer$exporter)) + 1, output_dim = 10)
+
+product_embedding <- product_input %>%
+  layer_embedding(input_dim = length(unique(X_importer$product)) + 1, output_dim = 10)
+
+importer_embedding_flat <- importer_embedding %>% layer_flatten()
+product_embedding_flat <- product_embedding %>% layer_flatten()
+
+numeric_input <- layer_input(shape = ncol(X_importer) - 2, name = "numeric_input")  # Exclude 'exporter' and 'product'
+
+concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
+
+# Add Dense layers for processing
+dense_layer <- concatenated %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, dtype = "float32")  # ✅ Ensures correct output type
+
+
+importer_model <- keras_model(
+  inputs = list(importer_input, product_input, numeric_input),
+  outputs = dense_layer
+)
+
+# Compile the model
+importer_model %>% compile(
+  loss = "mse",  # Mean Squared Error loss function for regression
+  optimizer = optimizer_adam(),
+  metrics = c("mae")  # Mean Absolute Error for evaluation
+)
+
+# Prepare the data for training
+importer_input_data <- as.integer(X_importer$exporter)  # Convert 'exporter' to integer
+product_input_data <- as.integer(X_importer$product)  # Convert 'product' to integer
+numeric_input_data_importer <- X_importer %>%
+  select(-exporter, -product) %>%  # Remove 'exporter', 'product', and 'value'
+  as.matrix()  # Convert to matrix
+```
+
+
+## Importer Model Training Performance
+
+Figure X illustrates the training history of the importer model, where loss and mean absolute error (MAE) are plotted against 30 epochs. The top panel shows the training loss (MSE), which decreases consistently and levels off at around epoch 20, an indication that the model is well-fitting the training data. Validation loss also decreases in the early epochs and stays constant thereafter, an indication that the model has converged without catastrophic overfitting.
+
+In the bottom panel, training MAE drops steadily throughout training and ends just over 0.05. Validation MAE, while higher and more unstable at the beginning, drops in the same way and begins to plateau at approximately epoch 20. During the later epochs, validation MAE continues to drop, further reducing the disparity between training and validation error.
+
+Together, these curves point to stable learning dynamics and a well-generalizing model. The importer model has good convergence, maintains low prediction error, and avoids overfitting—making it sufficient to generate reliable trade predictions on future UK import data.
+
+
+```{r}
+# Train the UK Importer model
+importer_history <- importer_model %>% fit(
+  x = list(
+    importer_input = importer_input_data,
+    product_input = product_input_data,
+    numeric_input = numeric_input_data_importer
+  ),
+  y = y_importer,
+  epochs = 30,
+  batch_size = 216,
+  validation_split = 0.2,
+  shuffle = TRUE  # ✅ Add this
+)
+```
+
+```{r}
+plot(importer_history) + ggtitle("Importer Model Training History")
+```
+
+```{r}
+# ----------------------------------------
+# Make Predictions for UK Exporter Model
+# ----------------------------------------
+# Determine the range of future years
+
+# ----------------------------------------
+# Make Predictions for UK Exporter Model
+# ----------------------------------------
+# Determine the range of future years
+
+future_years <- 2023:2030
+
+# 1. Get the top 10 products and countries (by total trade value)
+top10_export_products <- uk_export_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(product)
+
+top10_import_products <- uk_import_data %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(product)
+
+top10_export_countries <- uk_export_data %>%
+  group_by(importer) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(importer)
+
+top10_import_countries <- uk_import_data %>%
+  group_by(exporter) %>%
+  summarise(total_value = sum(value)) %>%
+  arrange(desc(total_value)) %>%
+  slice_head(n = 10) %>%
+  pull(exporter)
+
+# Helper function to scale years
+scale_year <- function(years, mean_val, sd_val) {
+  return((years - mean_val) / sd_val)
+}
+
+# Store original year scaling stats
+year_mean_export <- attr(uk_export_data$year, "scaled:center")
+year_sd_export <- attr(uk_export_data$year, "scaled:scale")
+year_mean_import <- attr(uk_import_data$year, "scaled:center")
+year_sd_import <- attr(uk_import_data$year, "scaled:scale")
+
+# Prepare export_forecast_data for predictions
+export_forecast_data <- data.frame(
+  year = rep(future_years, each = length(top10_export_products)),
+  product = rep(top10_export_products, times = length(future_years)),
+  importer = rep(top10_export_countries, times = length(future_years)),
+  value = NA  # Placeholder for predicted values
+)
+
+# Make predictions
+export_preds <- exporter_model %>% predict(list(
+  importer_input = as.integer(export_forecast_data$importer),
+  product_input = as.integer(export_forecast_data$product),
+  numeric_input = as.matrix(scale_year(export_forecast_data$year, year_mean_export, year_sd_export))
+))
+
+export_forecast_data$predicted_value <- as.numeric(export_preds * 
+  attr(uk_export_data$value, "scaled:scale") + 
+  attr(uk_export_data$value, "scaled:center"))
+
+# Prepare import_forecast_data for predictions
+import_forecast_data <- data.frame(
+  year = rep(future_years, each = length(top10_import_products)),
+  product = rep(top10_import_products, times = length(future_years)),
+  exporter = rep(top10_import_countries, times = length(future_years)),
+  value = NA  # Placeholder for predicted values
+)
+
+# Make predictions
+import_preds <- importer_model %>% predict(list(
+  importer_input = as.integer(import_forecast_data$exporter),
+  product_input = as.integer(import_forecast_data$product),
+  numeric_input = as.matrix(scale_year(import_forecast_data$year, year_mean_import, year_sd_import))
+))
+
+import_forecast_data$predicted_value <- as.numeric(import_preds * 
+  attr(uk_import_data$value, "scaled:scale") + 
+  attr(uk_import_data$value, "scaled:center"))
+
+# Decoding
+export_forecast_data$importer_label <- importer_levels[export_forecast_data$importer]
+export_forecast_data$product_label <- product_levels[export_forecast_data$product]
+
+
+import_forecast_data$exporter_label <- exporter_levels[import_forecast_data$exporter]
+import_forecast_data$product_label <- product_levels[import_forecast_data$product]
+
+
+
+
+```
+## Summary of training
+Overall, both the exporter and importer deep learning models had good and stable training performance. For both models, training and validation loss curves over 30 epochs plummeted consistently and eventually flattened, indicative of convergence. Mean absolute error (MAE) was minimal and quite stable, with hardly any divergence between training and validation sets—a great indication that the models generalized very well and didn't overfit the training data.
+
+Utilization of the embedding layers for categorical features, as well as mixed precision training and shuffling, supported efficient learning and consistency in performance. The adopted batch size of 216 and 20% validation split struck a good balance between generalization and training stability. Overall, the training results provide evidence that both models are appropriate for forecasting future UK trade flows, recognizing underlying patterns of trade without excessive sensitivity to noise or variance in the data.
+
+#Results
+## Forecasted Total Trade Overview
+Figure X shows the estimated United Kingdom overall imports, exports, and net trade balance for the period of 2023 to 2030. The import and export values are projected to decline regularly over the time period. Both imports (red line) and exports (blue line) are above each other at all times, with a negative trade balance. The net trade line (dashed black) is at an angle, showing an increasing deficit year to year.
+
+These forecasts have substantial economic implications. The persistent, rising trade deficit suggests increased foreign dependence on imports, which could translate into macroeconomic weaknesses such as stress on currency stability or adjustment of trade policy. The declining export trend, however, could be an indication of reduced global demand for UK products or international competitiveness.
+
+The nature of the forecasted trends also emphasizes how the deep learning model operates. As an autoregressive-style model, it generates forecasts using its own past forecasts, and this can lead to relatively smooth and conservative traces—especially where there are not strong directional indicators in the data used for training. But the late forecast horizon convexity to some extent reveals that the model has caught on to trends which are increasing and declining. This demonstrates the model's ability to pick up on very subtle structural trends, but also to highlight the necessity of interpreting results in light of the model's smoothing bias and underlying assumptions.
+
+
+
+```{R}
+### TOTAL
+
+
+
+
+# Calculate the total exports and imports
+export_totals <- export_forecast_data %>%
+  group_by(year) %>%
+  summarise(export_value = sum(predicted_value)) %>%
+  ungroup()
+
+import_totals <- import_forecast_data %>%
+  group_by(year) %>%
+  summarise(import_value = sum(predicted_value)) %>%
+  ungroup()
+
+# Combine the exports and imports into one data frame
+combined_totals <- full_join(export_totals, import_totals, by = "year") %>%
+  mutate(
+    # Calculate net trade: export_value - import_value
+    net_trade = import_value - export_value,
+  )
+
+# Plot the results
+ggplot(combined_totals, aes(x = year)) +
+  geom_line(aes(y = export_value, color = "Export"), size = 1) +
+  geom_line(aes(y = import_value, color = "Import"), size = 1) +
+  geom_line(aes(y = net_trade), color = "black", linetype = "dashed", size = 1) +
+  labs(
+    title = "Forecasted Total Import & Export (with Net Trade)",
+    y = "Trade Value",
+    color = "Trade Type"
+  ) +
+  scale_color_manual(values = c("Export" = "blue", "Import" = "red")) +
+  theme_minimal()
+
+```
+
+
+# Export top 10 producs
+
+Figure X displays the United Kingdom's top 10 export items' projected export values between 2023 and 2030. Vehicles remain the number one export by a significant margin, although their value is to drop steadily over the forecast period. Other major groups such as Medicaments, Petroleum Products, and Metals also exhibit a downward trend, although with varying slopes. Meanwhile, goods such as Plastics, Turbo-jets, and Turbines appear relatively stable with virtually no year-to-year fluctuation.
+
+As discussed above, the parallel and smooth nature of such trends points to the deep learning model's tendency to generalize on the basis of past patterns, especially when the latter are unadulterated with abrupt turns in the course of historical data. The projection suggests a broad-based downturn among product categories and not volatility in specific sectors. While this conservatism reduces overfitting, it could underplay product-level dynamics and future shocks. These results can most reasonably be interpreted as a macro-level extrapolation of structural trade adjustments, providing background for more in-depth study of particular sectoral opportunities or risks.
+
+```{R}
+
+ggplot(export_forecast_data %>% filter(product %in% top10_export_products),
+       aes(x = year, y = predicted_value, color = product_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(title = "Forecasted Export Value for Top 10 Products", y = "Export Value")
+```
+
+# Import top 10 producs
+
+Figure X demonstrates the United Kingdom's future import values of its top 10 imported commodities from 2023 to 2030. Vehicles (pink line) and petroleum products (greenish-blue line) dominate, although both lines follow a uniform decline with the passage of time. Medicaments and metals follow the same pattern, but they also have consistent but gradually falling import values. Items like plastics, data processing machinery, and transmission apparatus have relatively stable trends but contribute less to aggregate imports combined.
+As mentioned earlier, the smooth and very gently declining lines show the conservative tendency of the deep learning model, which likes to generalize in the absence of extreme external shocks or extreme trend reversals. Despite this smoothing, the model accurately identifies the direction of trade at the high level, showing gentle tapering of demand across most industrial and technology imports. These projections could be signs of either deceleration in domestic consumption or early signs of shifting trade trends and supply-chain strategies.
+
+
+```{r}
+import_forecast_data$short_label <- stringr::str_trunc(import_forecast_data$product_label, width = 30)
+
+ggplot(import_forecast_data %>%
+         filter(product %in% top10_import_products),
+       aes(x = year, y = predicted_value, color = short_label)) +
+  geom_line() +
+  labs(title = "Forecasted Import Value for Top 10 Products", y = "Import Value", color = "Product") +
+  theme_minimal()
+
+```
+
+# Export top 10 Countries
+
+Figure X shows the projected export values from the United Kingdom to its top 10 trade partners from 2023 to 2030. The United States (pink line) stands out as the leading export destination, although exports to the US are forecasted to decline steadily over the period. Similar downward trends are observed for other major partners such as Ireland, Italy, and the Netherlands, while countries like Germany, France, and China show relatively stable export values.
+
+As previously mentioned, these smooth and gradual trajectories reflect the deep learning model’s tendency to generalize based on historical patterns. In the absence of sharp fluctuations in the input data, the model produces conservative forecasts that may underrepresent short-term volatility. Despite this, the results highlight a broader trend of stagnating or declining exports across key markets, potentially pointing to structural challenges in maintaining global competitiveness. These forecasts serve as a baseline for trade expectations but should be considered alongside external factors such as policy changes and global economic shifts.
+
+
+
+```{r}
+# importer is the receiving country for export data
+ggplot(export_forecast_data %>% 
+         filter(importer %in% top10_export_countries) %>%
+         mutate(importer_label = importer_levels[importer]),
+       aes(x = year, y = predicted_value, color = importer_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(title = "Forecasted Export Value by Top 10 Countries", y = "Export Value")
+```
+
+# Import top 10 producs
+Figure X illustrates the forecast import values for the United Kingdom's top 10 suppliers between 2023-2030. The dominant source of UK imports over the forecast horizon remains Germany (green line), with the USA and Netherlands ranking second and third, respectively. Even though all countries depict a general decline in import values, the relative positions remain quite consistent, i.e., enduring supplier relationships over time.
+
+The overall downward trend of import values tracks the model's learned prediction for reduced trade volume in the coming few years. As noted earlier, the linear and smooth nature of these projections is a result of the deep learning model's autoregressive approach and its low sensitivity to external shocks or macroeconomic factors.
+
+Despite these limitations, the model offers useful insights into long-term trade dependencies. The continued dominance of both North American and European suppliers is indicative of the UK's ongoing reliance on traditional partners for trade, even in the presence of shifting global trends and post-Brexit reconfigurations.
+
+
+```{r}
+# exporter is the sending country for import data
+ggplot(import_forecast_data %>%
+         filter(exporter %in% top10_import_countries) %>%
+         mutate(exporter_label = exporter_levels[exporter]),
+       aes(x = year, y = predicted_value, color = exporter_label)) +
+  stat_summary(fun = sum, geom = "line") +
+  labs(title = "Forecasted Import Value by Top 10 Countries", y = "Import Value")
+```
+## Deep learning conclusion
+
+The deep learning models built within this report were designed to forecast the future trade values of the United Kingdom by trade partners and products. Two models were developed: one where the UK is exporting, and another where the UK is importing. Both used categorical embeddings for trade partners and products, while dense layers were used to handle the standardized year feature to make continuous trade value predictions. The models agreed well on training and cross-validated stably with no strong indication of overfitting.
+
+Nevertheless, even though the models were successful at modeling general directional tendencies, they also made apparent some of the main limitations of deep learning here. The autoregressive-style forecasting—predicting ahead based on learned earlier patterns—is likely to produce smooth, almost-linear traces unless strong signals in the data compel them otherwise. This results in fairly flat lines between countries and products and might downplay market volatility, shocks, or inflection points. Additionally, the absence of temporal memory (e.g., no recurrent or attention-based architecture) also limits the model to less effectively capture multi-year dynamics or sequential dependencies.
+
+Even while clustering and correlation analysis did reveal strong structure in the data, specifically in industrial categories, the deep models did not know about this hidden structure and were treating all inputs the same. This provides some potential for follow-up research—accepting pre-clustered inputs or graph embeddings could improve model performance at being able to tell similar from dissimilar trade regimes. In short, the models do provide useful high-level forecasts, but what they generate should be interpreted as trend baselines and not actual future values.
+
+
+# Final conclusion
+
+Conclusion
+
+This report sought to investigate if UK trade data—overall, product-wise, and country-wise—can be forecasted and if so, what challenges lie in doing so. The analysis started with a thorough visual inspection using the aid of trade data from 1995 to 2023, and some of the long-run trends such as an endemic trade deficit, the UK's dependence on a few key trade partners, and the dominance of industrial goods such as cars, petroleum, and pharmaceuticals were found.
+
+Correlation analysis showed how some sectors, such as automobiles and aerospace, move in tandem, while others, such as the drug industry, have more different trajectories. Clustering took this a step further by grouping products and nations into similarity clusters and revealing intertwined webs of commerce that could be utilized to inform modeling as well as policy decisions.
+
+Deep learning was subsequently applied to forecast trade from 2023 through 2030. Although the models were effective at making sense directional forecasts and identifying accelerating trends (such as widening the trade deficit), the models also made evident the limitations of machine learning for long-run economic forecasting. The autoregressive nature of the models, reliance on historical data, and tendency to generate smooth output curves limit their ability to forecast shocks, policy changes, or interruptions in markets—especially in a post-Brexit, post-pandemic world.
+
+Lastly, this project demonstrates how deep learning can be a valuable tool for macroeconomic trend forecasting, particularly when coupled with exploratory analysis and clustering. Predictions should, however, be understood within the context of model behavior and contextual knowledge. The inclusion of additional features (e.g., policy shifts, global demand indexes, or time-series memory models) might lead to greater accuracy and interpretability in the future.
+
+
+# Reference
+
+https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37
+
+# appendix
+All code and supporting documents are available on github in the following perma link
+
+https://github.com/maxaus2002/ASSESSMENT-2-for-MAST7220/tree/4ee2afca34a870aa6cfba57fd4bb3f3344b36c84
