@@ -1,0 +1,679 @@
+---
+title: "Powerpoint for report"
+author: "Max Austin - Mada2"
+date: "`r Sys.Date()`"
+output: powerpoint_presentation
+---
+
+```{r setup, include=FALSE}
+# Set global knitting options to suppress code output, messages, and warnings
+knitr::opts_chunk$set(
+  echo = FALSE,      # Do not display code in the final report
+  message = FALSE,   # Suppress messages from package loading or functions
+  warning = FALSE    # Suppress warnings during code execution
+)
+
+
+# Install required packages if not already installed
+# install.packages("tinytex")
+# tinytex::install_tinytex()
+
+# install.packages("readr")       # For reading CSV and other delimited files
+library(readr)
+
+# install.packages("dplyr")       # For data manipulation and transformation
+library(dplyr)
+
+# install.packages("tidyr")       # For reshaping and tidying data
+library(tidyr)
+
+# install.packages("stringr")     # For string operations
+library(stringr)
+
+# install.packages("ggplot2")     # For data visualization
+library(ggplot2)
+
+# install.packages("viridis")     # For color palettes in plots
+library(viridis)
+
+# install.packages("treemap")     # For hierarchical treemap visualizations
+library(treemap)
+
+# install.packages("corrplot")    # For correlation matrix visualizations
+library(corrplot)
+
+# install.packages("cluster")     # For clustering algorithms (e.g., k-means, PAM)
+library(cluster)
+
+# install.packages("factoextra")  # For visualizing clustering results
+library(factoextra)
+
+# install.packages("knitr")       # For dynamic report generation
+library(knitr)
+
+# install.packages("igraph")      # For creating and manipulating network graphs
+library(igraph)
+
+# install.packages("ggraph")      # For visualizing graph objects (built on ggplot2)
+library(ggraph)
+
+# install.packages("tidygraph")   # For tidy graph manipulation with dplyr-like syntax
+library(tidygraph)
+
+
+```
+
+
+# Motivation
+
+- **Why UK Trade?**
+  - Large, rich dataset available from the **CEPII BACI** database
+  - Personal interest in international trade and forecasting
+
+- **Relevant Skills Developed**
+  - **Deep learning** using TensorFlow in both **R** and **Python**
+  - **Classification models**:
+    - Predict future trade based on historical features
+  - **Clustering techniques**:
+    - Group similar trade items or partners
+    - Applied **K-means** to identify patterns
+
+# Research Questions
+- **Can we forecast future UK trade data?**
+  - Total exports and imports  
+    - Will overall trade grow or decline?
+  - Trade by product  
+    - Which goods will dominate?
+  - Trade by partner country  
+    - Will new countries become more prominent?
+
+- **Challenges of forecasting long-term trade**
+  - Economic shocks (e.g., COVID-19, financial crises)
+  - Policy and geopolitical uncertainty (e.g., Brexit)
+  - Structural changes in industry or consumer demand
+  - Model limitations for long-term prediction
+
+# Overview of Data
+
+- The original dataset from the CEPII BACI database contained **258 million+ rows**, covering:
+  - **Trade flows** between 238 countries
+  - **Over 5,000 products** using 6-digit Harmonized System (HS) codes  
+  - **Annual data** from 1995 to 2023
+
+- **Preprocessing steps** included:
+  - Filtering rows where the **UK was either importer or exporter**
+  - Merging similar products (e.g., combining 21 categories of “meat” into one)
+  - **Decoding** numeric country and product codes into readable labels
+  - Cleaning and reducing the dataset to around **5 million rows** for focused analysis
+
+#Visualisations
+
+
+```{r include=FALSE}
+# ----------------------------------------
+# Data Import and Preprocessing
+# ----------------------------------------
+
+# Define column types for consistency during import
+col_spec <- cols(
+  k = col_character(),  # Product code
+  t = col_double(),     # Year
+  i = col_double(),     # Exporter code
+  j = col_double(),     # Importer code
+  v = col_double(),     # Trade value
+  q = col_double()      # Quantity
+)
+
+# Load and parse CSV files (first 29 files only)
+files <- list.files(pattern = "*.csv")
+data_list <- lapply(files[1:29], function(file) {
+  read_csv(file, col_types = col_spec)
+})
+
+# Load code mappings for countries and products
+country_codes <- read_csv("codes/country_codes_V202501.csv")
+product_codes <- read_csv("codes/product_codes_HS92_V202501.csv")
+
+# Rename columns to meaningful names
+rename_columns <- function(data) {
+  data %>%
+    rename(
+      year = t,
+      exporter = i,
+      importer = j,
+      product = k,
+      value = v,
+      quantity = q
+    )
+}
+data_list <- lapply(data_list, rename_columns)
+
+# Combine all files into a single dataset
+combined_data <- bind_rows(data_list)  # ~258,605,562 observations
+
+# Remove raw list to save memory
+rm(data_list)
+gc()
+
+# Filter dataset to only include UK-related trade (as exporter or importer)
+combined_data <- combined_data %>%
+  filter(exporter == "826" | importer == "826")  # ~13,367,259 observations
+
+# Replace numerical country codes with country names
+replace_country_codes <- function(data) {
+  data %>%
+    mutate(exporter = as.character(exporter),
+           importer = as.character(importer)) %>%
+    left_join(
+      country_codes %>%
+        mutate(country_code = as.character(country_code)) %>%
+        select(country_code, country_name) %>%
+        rename(exporter_name = country_name),
+      by = c("exporter" = "country_code")
+    ) %>%
+    mutate(exporter = exporter_name) %>%
+    select(-exporter_name) %>%
+    left_join(
+      country_codes %>%
+        mutate(country_code = as.character(country_code)) %>%
+        select(country_code, country_name) %>%
+        rename(importer_name = country_name),
+      by = c("importer" = "country_code")
+    ) %>%
+    mutate(importer = importer_name) %>%
+    select(-importer_name)
+}
+combined_data <- replace_country_codes(combined_data)
+
+# Replace product codes with product descriptions
+replace_product_codes <- function(data) {
+  data %>%
+    mutate(product = as.character(product)) %>%
+    left_join(
+      product_codes %>%
+        mutate(code = as.character(code)) %>%
+        select(code, description),
+      by = c("product" = "code")
+    ) %>%
+    mutate(product = description) %>%
+    select(-description)
+}
+combined_data <- replace_product_codes(combined_data)
+
+# Remove descriptive suffixes from product names (e.g., after ":")
+remove_description_from_product <- function(data) {
+  data %>%
+    mutate(product = sub(":.*", "", product))
+}
+combined_data <- remove_description_from_product(combined_data)
+
+# Aggregate multiple petroleum-related rows into a single category
+merge_petroleum_rows <- function(data) {
+  petroleum_data <- data %>%
+    filter(grepl("petroleum", product, ignore.case = TRUE)) %>%
+    group_by(year, exporter, importer) %>%
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      product = "Petroleum Products",
+      .groups = "drop"
+    )
+
+  data %>%
+    filter(!grepl("petroleum", product, ignore.case = TRUE)) %>%
+    bind_rows(petroleum_data)
+}
+combined_data <- merge_petroleum_rows(combined_data)
+
+# Aggregate rows by year, exporter, importer, and product
+merge_rows_by_group <- function(data) {
+  data %>%
+    group_by(year, exporter, importer, product) %>%
+    summarise(
+      value = sum(value, na.rm = TRUE),
+      quantity = sum(quantity, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+combined_data <- merge_rows_by_group(combined_data)  # ~4,958,186 observations
+
+# Separate data into UK as exporter vs. UK as importer
+uk_exporter_data <- combined_data %>%
+  filter(exporter == "United Kingdom")  # ~3,385,077 observations
+
+uk_importer_data <- combined_data %>%
+  filter(importer == "United Kingdom")  # ~1,588,878 observations
+
+# Compute total trade values for summary
+importsum <- sum(uk_importer_data$value)
+exportsum <- sum(uk_exporter_data$value)
+
+# Clean up memory and remove unneeded variables
+rm(col_spec, files, country_codes, product_codes,
+   rename_columns, replace_country_codes, 
+   remove_description_from_product, 
+   merge_petroleum_rows, merge_rows_by_group)
+gc()
+
+
+```
+
+
+
+# Export value by top products
+
+
+```{r}
+# Plot export value trends over time for the top 10 products (by year)
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(year, product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_export_value))) %>%
+  filter(rank <= 10) %>%               # Retain only the top 10 products per year
+  ungroup() %>%
+  complete(year, product, fill = list(total_export_value = 0)) %>%  # Fill gaps for continuity in area chart
+  ggplot(aes(x = year, y = total_export_value, fill = product)) +
+  geom_area(alpha = 0.6) +             # Stacked area chart
+  scale_fill_viridis(discrete = TRUE) +  
+  labs(
+    title = "Export Value Over Time by Top 10 Products",
+    x = "Year",
+    y = "Export Value",
+    fill = "Product"
+  ) +
+  theme_minimal()
+
+```
+
+
+# Import value by top products
+
+
+```{r}
+# Plot import value trends over time for the top 10 products (by year)
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(year, product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(rank = dense_rank(desc(total_import_value))) %>%
+  filter(rank <= 10) %>%               # Keep only the top 10 products per year
+  ungroup() %>%
+  complete(year, product, fill = list(total_import_value = 0)) %>%  # Fill missing product-year combinations with 0
+  ggplot(aes(x = year, y = total_import_value, fill = product)) +
+  geom_area(alpha = 0.6) +             # Use area chart to show composition over time
+  scale_fill_viridis(discrete = TRUE) +
+  labs(
+    title = "Import Value Over Time by Top 10 Products",
+    x = "Year",
+    y = "Import Value",
+    fill = "Product"
+  ) +
+  theme_minimal()
+
+```
+# Treemap of exports by product
+
+
+```{r}
+# Create a treemap of the top 25 UK export products by total trade value
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_export_value) %>%   # Select top 25 products by export value
+  treemap(
+    dtf = .,                          # Use the resulting data frame
+    index = c("product"),             # Product names as tree map categories
+    vSize = "total_export_value",     # Rectangle size based on export value
+    vColor = "total_export_value",    # Color also mapped to export value
+    draw = TRUE,
+    title = "Top 25 UK Export Products"
+  )
+
+
+```
+# Top 25 UK Import Products
+
+```{r}
+# Create a treemap of the top 25 UK import products by total trade value
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_import_value) %>%   # Select top 25 products by import value
+  treemap(
+    dtf = .,                          # Use the resulting data frame
+    index = c("product"),             # Product names as categories
+    vSize = "total_import_value",     # Rectangle size mapped to import value
+    vColor = "total_import_value",    # Color intensity also reflects import value
+    draw = TRUE,
+    title = "Top 25 UK Import Products"
+  )
+
+```
+
+# Treemap of exports by importer
+
+
+```{r}
+# Create a treemap of the top 25 destination countries for UK exports
+combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_export_value) %>%   # Select top 25 destination countries
+  treemap(
+    dtf = .,                          # Use the summarized data
+    index = c("importer"),            # Group by importer (i.e., destination country)
+    vSize = "total_export_value",     # Rectangle size based on total export value
+    vColor = "total_export_value",    # Color mapped to export value
+    draw = TRUE,
+    title = "Top 25 UK Export Destinations"
+  )
+
+```
+
+# Treemap of exports by importer
+
+```{r}
+# Create a treemap of the top 25 countries exporting to the UK
+combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(25, total_import_value) %>%   # Select top 25 source countries by import value
+  treemap(
+    dtf = .,                          # Use the summarized data
+    index = c("exporter"),            # Group by exporter (i.e., source country)
+    vSize = "total_import_value",     # Rectangle size based on import value
+    vColor = "total_import_value",    # Color intensity mapped to import value
+    draw = TRUE,
+    title = "Top 25 UK Import Sources"
+  )
+
+```
+# Top 5 Goods Exported, and who they are exported to
+
+```{r}
+# Identify the top 5 exported products from the UK by total trade value
+top_export_goods <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(5, total_export_value)
+
+# For each of the top 5 products, identify the top 5 importing countries
+combined_data %>%
+  filter(exporter == "United Kingdom" & product %in% top_export_goods$product) %>%
+  group_by(product, importer) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(product) %>%
+  top_n(5, total_export_value) %>%
+  
+  # Plot export values to top 5 importers per product
+  ggplot(aes(x = reorder(importer, total_export_value), y = total_export_value, fill = importer)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~product, scales = "free_y") +
+  labs(
+    title = "Top 5 UK Export Goods and Their Top 5 Importing Countries",
+    x = "Importer Country",
+    y = "Total Export Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+# Top 5 imported goods, and who they are imported from
+
+```{r}
+# Identify the top 5 imported products into the UK by total trade value
+top_import_goods <- combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  top_n(5, total_import_value)
+
+# For each of the top 5 imported products, find the top 5 exporting countries
+combined_data %>%
+  filter(importer == "United Kingdom" & product %in% top_import_goods$product) %>%
+  group_by(product, exporter) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(product) %>%
+  top_n(5, total_import_value) %>%
+  
+  # Plot import values from top 5 exporters for each top product
+  ggplot(aes(x = reorder(exporter, total_import_value), y = total_import_value, fill = exporter)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~product, scales = "free_y") +
+  labs(
+    title = "Top 5 UK Import Goods and Their Top 5 Exporting Countries",
+    x = "Exporter Country",
+    y = "Total Import Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+
+# Overview of methodology
+
+- **Correlation Analysis**
+  - Explore how different products and trade partners move together
+  - Identify strong relationships between key sectors (e.g., aerospace, energy)
+
+- **Clustering**
+  - Group similar products based on trade patterns
+  - Used **K-means** and network-based methods to uncover hidden structure
+
+- **Deep Learning**
+  - Developed two neural network models to forecast future trade
+  - One model for UK as **exporter**, another for **importer**
+  - Embedded categorical variables and scaled numeric ones
+
+
+# Correlation Between Top Export Products
+
+```{r}
+# Identify the top 10 export products from the UK by total trade value
+top_10_export_products_aggregated <- combined_data %>%
+  filter(exporter == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_export_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_export_value)) %>%
+  top_n(10, total_export_value)
+
+# Aggregate annual export values for the top 10 products
+top_10_export_product_data_agg <- combined_data %>%
+  filter(exporter == "United Kingdom" & product %in% top_10_export_products_aggregated$product) %>%
+  group_by(year, product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  spread(key = product, value = total_value)  # Convert to wide format for correlation matrix
+
+# Compute the correlation matrix between top 10 products across years
+export_correlation_matrix <- cor(top_10_export_product_data_agg[, -1], use = "complete.obs")
+
+# Visualize the correlation matrix using a circular upper-triangle layout
+corrplot(export_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+
+```
+# Correlation Between Top Import Products
+
+
+```{r}
+# Identify the top 10 imported products into the UK by total trade value
+top_10_import_products_aggregated <- combined_data %>%
+  filter(importer == "United Kingdom") %>%
+  group_by(product) %>%
+  summarise(total_import_value = sum(value, na.rm = TRUE)) %>%
+  arrange(desc(total_import_value)) %>%
+  top_n(10, total_import_value)
+
+# Aggregate annual import values for the top 10 products
+top_10_import_product_data_agg <- combined_data %>%
+  filter(importer == "United Kingdom" & product %in% top_10_import_products_aggregated$product) %>%
+  group_by(year, product) %>%
+  summarise(total_value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  spread(key = product, value = total_value)  # Convert to wide format for correlation analysis
+
+# Compute correlation matrix between top 10 imported products across years
+import_correlation_matrix <- cor(top_10_import_product_data_agg[, -1], use = "complete.obs")
+
+# Visualize the correlation matrix using circular representation (upper triangle only)
+corrplot(import_correlation_matrix, method = "circle", type = "upper", tl.cex = 0.8)
+
+```
+
+
+# clustering using k-means
+
+
+```{r}
+# 1) Subset UK import & export data
+uk_import_data <- combined_data %>% filter(importer == "United Kingdom")
+uk_export_data <- combined_data %>% filter(exporter == "United Kingdom")
+
+# 2) Top‑10 partners & products
+top_exporters       <- uk_import_data %>% group_by(exporter) %>% summarise(total = sum(value,na.rm=TRUE)) %>% slice_max(total, n=10) %>% pull(exporter)
+top_importers       <- uk_export_data %>% group_by(importer) %>% summarise(total = sum(value,na.rm=TRUE)) %>% slice_max(total, n=10) %>% pull(importer)
+top_import_products <- uk_import_data %>% group_by(product ) %>% summarise(total = sum(value,na.rm=TRUE)) %>% slice_max(total, n=10) %>% pull(product )
+top_export_products <- uk_export_data %>% group_by(product ) %>% summarise(total = sum(value,na.rm=TRUE)) %>% slice_max(total, n=10) %>% pull(product )
+
+# 3) Generic time‑series clustering
+cluster_ts <- function(df, key, keep) {
+  tsw <- df %>%
+    filter(.data[[key]] %in% keep) %>%
+    group_by(.data[[key]], year) %>%
+    summarise(total = sum(value,na.rm=TRUE), .groups="drop") %>%
+    pivot_wider(names_from=year, values_from=total, values_fill=0)
+  M <- tsw %>% select(-all_of(key)) %>% as.matrix() %>% scale()
+  set.seed(42)
+  cl <- kmeans(M, centers=4)
+  tsw %>% mutate(cluster=cl$cluster)
+}
+
+exp_ct  <- cluster_ts(uk_import_data,   "exporter", top_exporters)
+imp_ct  <- cluster_ts(uk_export_data,   "importer", top_importers)
+iprod_ct<- cluster_ts(uk_import_data,   "product" , top_import_products)
+eprod_ct<- cluster_ts(uk_export_data,   "product" , top_export_products)
+
+# 4) Build igraph from correlations >.8
+make_graph <- function(df, key) {
+  mat <- df %>% select(-all_of(key), -cluster) %>% as.matrix()
+  rownames(mat) <- df[[key]]
+  C <- cor(t(mat), use="pairwise.complete.obs")
+  idx <- which(upper.tri(C)&C>.8, arr.ind=TRUE)
+  edges <- data.frame(
+    from = rownames(C)[idx[,1]],
+    to   = rownames(C)[idx[,2]]
+  )
+  nodes <- df %>% transmute(
+    name       = .data[[key]],
+    cluster    = factor(cluster),
+    total_value= rowSums(select(., -all_of(key), -cluster))
+  )
+  graph_from_data_frame(edges, vertices=nodes, directed=FALSE)
+}
+
+g_exp  <- make_graph(exp_ct,   "exporter")   # countries → UK imports
+g_imp  <- make_graph(imp_ct,   "importer")   # countries ← UK exports
+g_ip   <- make_graph(iprod_ct, "product" )   # prod clusters → UK imports
+g_ep   <- make_graph(eprod_ct, "product" )   # prod clusters ← UK exports
+
+# 5) Four network plots
+```
+
+```{r}
+# Product Clusters — UK Imports
+ggraph(g_ip, layout="fr") +
+  geom_edge_link(alpha=0.2) +
+  geom_node_point(aes(size=total_value, color=cluster)) +
+  geom_node_text(aes(label=name), repel=TRUE, size=3) +
+  theme_void() +
+  labs(title="Product Clusters — UK Imports", color="Cluster", size="Value")
+```
+
+```{r}
+# Product Clusters — UK Exports
+ggraph(g_ep, layout="fr") +
+  geom_edge_link(alpha=0.2) +
+  geom_node_point(aes(size=total_value, color=cluster)) +
+  geom_node_text(aes(label=name), repel=TRUE, size=3) +
+  theme_void() +
+  labs(title="Product Clusters — UK Exports", color="Cluster", size="Value")
+```
+
+
+
+## Deep Learning
+
+- **What is Deep Learning?**  
+  Multi-layer neural networks that excel at learning complex, non‑linear patterns.
+
+- **Our Approach**  
+  - Two **autoregressive LSTM** models in R (Keras + TensorFlow 2.10)  
+    - **Exporter model:** UK as exporter → predict exports  
+    - **Importer model:** UK as importer → predict imports  
+  - **Inputs**:  
+    - Categorical: partner country & product → **learnable embeddings**  
+    - Numeric: year + lag₁–lag₃ trade values → **standardized** (zero mean, unit variance)  
+  - **Architecture**:  
+    1. Embedding layers →  
+    2. Dense projection →  
+    3. RepeatVector →  
+    4. **LSTM** →  
+    5. Dense → output
+
+- **Training Details**  
+  - **20 epochs**, batch size 216  
+  - **Mixed‑precision** (`mixed_float16`) for speed  
+  - Loss: **MSE**; Metric: **MAE**  
+  - 20% validation split, shuffle each epoch
+
+---
+
+## Model Comparison
+
+- **Benchmarks**  
+  - **Linear Regression**  
+    - Pros: simple, interpretable  
+    - Cons: no memory of past values, misses non‑linear trends  
+  - **Random Forest Regression**  
+    - Pros: captures non‑linearity  
+    - Cons: unstable time‑series forecasts, prone to overfitting  
+
+- **Autoregressive LSTM**  
+  - Leverages **lagged history** to capture sequential dependencies  
+  - **Learned embeddings** for high‑cardinality categoricals  
+  - Produces **smoother**, more **consistent** forecasts  
+  - Achieved **lowest MAE** on hold‑out data
+
+---
+
+## Conclusion
+
+- **Key Takeaways**  
+  - UK’s **trade deficit** is structural and forecast to persist  
+  - **Vehicles**, **pharmaceuticals**, **machinery** dominate exports  
+  - **Germany**, **China**, **USA**, **Norway** lead in imports  
+
+- **Deep Learning Strengths**  
+  - Captures long‑term momentum via autoregressive LSTM  
+  - Robust high‑level forecasts across products & partners  
+  - Outperforms simpler baselines on MAE  
+
+- **Limitations & Next Steps**  
+  - Smooth, conservative outputs understate shocks or policy changes  
+  - Does not include exogenous variables or regime shifts  
+  - Future work:  
+    - Integrate macro‑economic indicators (GDP, exchange rates, policy events)  
+    - Incorporate **graph/cluster embeddings** or **attention** models  
+    - Add **shock-detection** or **switching‑regime** components  
