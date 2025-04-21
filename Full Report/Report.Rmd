@@ -232,12 +232,13 @@ uk_importer_data <- combined_data %>%
 importsum = sum(uk_importer_data$value)
 exportsum = sum(uk_exporter_data$value)
 
-# Clean up the environment, remove unnecessary variables
-rm(col_spec, files, country_codes, product_codes, rename_columns, replace_country_codes, remove_description_from_product, merge_petroleum_rows, merge_rows_by_group)
-gc()
-
 
 ```
+
+
+
+
+
 
 Before any useful analysis can be performed, the raw trade data set must be processed into a usable form. The original data set, which was retrieved from the CEPII BACI database, includes over 258 million observations of international trade. To narrow the focus to the UK, all rows where the UK was either the importer or exporter were taken, reducing the data set to 13,367,259 observations.
 
@@ -247,6 +248,12 @@ After consolidation and further cleaning, the dataset was reduced to 4,958,186 o
 
 Though this would at first glance suggest that the UK exports more than it imports in terms of volume of transactions, the value of trade paints a different picture. The aggregate value of UK imports during this period is `r importsum`, whereas the aggregate value of exports is `r exportsum`, with a resultant overall trade balance of `r exportsum - importsum`.
 
+```{r include=FALSE}
+# Remove all objects from the environment except 'combined_data' to reduce memory usage
+rm(list = setdiff(ls(), c("combined_data")))
+gc()  # Run garbage collection to free up unused memory
+
+```
 
 # Visualisation
 
@@ -1080,474 +1087,576 @@ Both models were trained using 30 epochs and a batch size of 216, selected after
 
 The loss function used was mean squared error (MSE), with mean absolute error (MAE) tracked as a secondary performance measure. A validation split of 20% was used in training, and shuffling was enabled to aid generalization. Model performance was monitored while training via training history plots. Both models displayed steady convergence and minimal divergence between training and validation error curves, indicating high generalization and no overfitting evidence
 
+```{r}
+# SECTION 1: MIXED PRECISION
+# Enable mixed precision (optional, if supported hardware)
+policy <- tf$keras$mixed_precision$Policy("mixed_float16")
+tf$keras$mixed_precision$set_global_policy(policy)
 
+# =============================================================================
+# 2) DATA PREPARATION
+# =============================================================================
+# combined_data has: year, exporter, importer, product, value, quantity
+combined_data_dl <- combined_data %>%
+  # drop quantity (unused)
+  select(-quantity) %>%
+  # denoise: remove very small trades
+  filter(value >= 2500) %>%
+  # log‐transform the value
+  mutate(value = log1p(value))
+
+# create lag_1, lag_2, lag_3 by exporter/importer/product groups
+num_lags <- 3
+generate_lags <- function(df, by_vars, value_var, n_lags) {
+  for (lag in seq_len(n_lags)) {
+    lag_name <- paste0("lag_", lag)
+    df <- df %>%
+      group_by(across(all_of(by_vars))) %>%
+      arrange(year) %>%
+      mutate(!!lag_name := dplyr::lag(.data[[value_var]], lag)) %>%
+      ungroup()
+  }
+  df
+}
+
+combined_data_dl <- combined_data_dl %>%
+  generate_lags(
+    by_vars    = c("exporter","importer","product"),
+    value_var  = "value",
+    n_lags     = num_lags
+  ) %>%
+  # drop any rows missing lag_1/2/3
+  filter(if_all(starts_with("lag_"), ~ !is.na(.)))
+```
 
 ```{r}
-policy <- tf$keras$mixed_precision$Policy("mixed_float16")
-combined_data_dl <- combined_data %>%
-  select(-quantity)
-
-# Filter data for UK Exporter
+# =============================================================================
+# 3) SPLIT UK EXPORT & IMPORT DATASETS
+# =============================================================================
+# UK as EXPORTER → partner is importer
 uk_export_data <- combined_data_dl %>%
   filter(exporter == "United Kingdom") %>%
+  drop_na(importer, product) %>%
   mutate(
-    importer = as.integer(factor(importer)),  # Integer encoding for importer
-    product = as.integer(factor(product))     # Integer encoding for product
-  ) %>%
-  filter(!is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+    importer = factor(importer),  # keep as factor
+    product  = factor(product)
+  )
 
-# Filter data for UK Importer
-uk_import_data <- combined_data_dl %>%
-  filter(importer == "United Kingdom") %>%
-  mutate(
-    exporter = as.integer(factor(exporter)),  # Integer encoding for exporter
-    product = as.integer(factor(product))     # Integer encoding for product
-  ) %>%
-  filter(!is.na(exporter) & !is.na(importer) & !is.na(product) & !is.na(value) & !is.na(year))
+# store these for decoding
+exp_imp_levels  <- levels(uk_export_data$importer)
+exp_prod_levels <- levels(uk_export_data$product)
 
-exporter_levels <- levels(factor(combined_data$exporter))
-importer_levels <- levels(factor(combined_data$importer))
-
-
-product_levels <- levels(factor(combined_data$product))
-
-# Normalize numerical columns (value, year)
+# now convert to integer codes
 uk_export_data <- uk_export_data %>%
   mutate(
-    value = scale(value),
-    year = scale(year)
+    importer = as.integer(importer),
+    product  = as.integer(product)
   )
+
+# UK as IMPORTER → partner is exporter
+uk_import_data <- combined_data_dl %>%
+  filter(importer == "United Kingdom") %>%
+  drop_na(exporter, product) %>%
+  mutate(
+    exporter = factor(exporter),
+    product  = factor(product)
+  )
+
+imp_exp_levels  <- levels(uk_import_data$exporter)
+imp_prod_levels <- levels(uk_import_data$product)
 
 uk_import_data <- uk_import_data %>%
   mutate(
-    value = scale(value),
-    year = scale(year)
+    exporter = as.integer(exporter),
+    product  = as.integer(product)
   )
+```
 
-# Prepare features (X) and target (y) for predictions
-X_exporter <- uk_export_data %>% select(-value,-exporter)
-y_exporter <- uk_export_data$value
+```{r}
+# =============================================================================
+# 4) NORMALIZE NUMERIC COLUMNS
+# =============================================================================
+scale_all <- function(df, cols) {
+  for (c in cols) df[[c]] <- scale(df[[c]])
+  df
+}
 
-
-
-X_importer <- uk_import_data %>% select(-value,-importer)
-y_importer <- uk_import_data$value
-
-# Model for UK as Exporter (with embeddings for categorical variables)
-importer_input <- layer_input(shape = 1, name = "importer_input")
-product_input <- layer_input(shape = 1, name = "product_input")
-
-importer_embedding <- importer_input %>%
-  layer_embedding(input_dim = length(unique(X_exporter$importer)) + 1, output_dim = 10)
-
-product_embedding <- product_input %>%
-  layer_embedding(input_dim = length(unique(X_exporter$product)) + 1, output_dim = 10)
-
-importer_embedding_flat <- importer_embedding %>% layer_flatten()
-product_embedding_flat <- product_embedding %>% layer_flatten()
-
-numeric_input <- layer_input(shape = ncol(X_exporter) - 2, name = "numeric_input")  # Exclude 'importer' and 'product'
-
-concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
-
-# Add Dense layers for processing
-dense_layer <- concatenated %>%
-  layer_dense(units = 64, activation = "relu") %>%
-  layer_dense(units = 32, activation = "relu") %>%
-  layer_dense(units = 1, dtype = "float32")  # ✅ Ensures correct output type
-
-
-exporter_model <- keras_model(
-  inputs = list(importer_input, product_input, numeric_input),
-  outputs = dense_layer
-)
-
-# Compile the model
-exporter_model %>% compile(
-  loss = "mse",  # Mean Squared Error loss function for regression
-  optimizer = optimizer_adam(),
-  metrics = c("mae")  # Mean Absolute Error for evaluation
-)
-
-# Prepare the data for training
-
-importer_input_data <- as.integer(X_exporter$importer)
-product_input_data <- as.integer(X_exporter$product)
-
-numeric_input_data <- X_exporter %>%
-  select(-importer, -product) %>%
-  as.matrix()  # Ensure it’s numeric and in matrix form
-
-
-y_exporter <- as.numeric(y_exporter)
-
-
+scale_cols <- c("value","year", paste0("lag_",1:num_lags))
+uk_export_data <- scale_all(uk_export_data, scale_cols)
+uk_import_data <- scale_all(uk_import_data, scale_cols)
 
 ```
 
-# Training
-## Exporter Model Training Performance
- 
+```{r include=FALSE}
 
-Figure X illustrates the training history of the exporter model over 30 epochs, loss (top panel) and mean absolute error (MAE, bottom panel) on the training and validation sets.
+# =============================================================================
+# 5) DEFINE & COMPILE EXPORTER LSTM MODEL
+# =============================================================================
+# Inputs for exporter_model: importer_id, product_id, [year + lags] sequence
+X_exp   <- uk_export_data %>% select(-value,-exporter)
+y_exp   <- as.numeric(uk_export_data$value)
 
-Loss (Top Plot):
-The training loss is gradually diminishing, which is a promise that the model is actually learning from the data. Validation loss also exhibits the same pattern but begins to plateau at epoch 20, indicating that the model is getting close to its optimal capacity to generalize from the training set. Most significantly, there is no significant divergence of training and validation loss, indicating little likelihood of overfitting.
+imp_in   <- layer_input(shape=1, name="importer_input")
+prod_in  <- layer_input(shape=1, name="product_input")
+num_in   <- layer_input(shape=c(ncol(X_exp)-2,1), name="numeric_input")
 
-MAE (Bottom Plot):
-MAE training decreases consistently, falling below 0.05 by the final epoch. Although the validation MAE is more prone to fluctuations, it stabilizes after around 10 epochs and is fairly close to the training curve. These minor fluctuations are to be expected with the actual data and indicate no model instability.
+imp_emb  <- imp_in  %>% layer_embedding(input_dim=max(X_exp$importer)+1, output_dim=10) %>% layer_flatten()
+prod_emb <- prod_in %>% layer_embedding(input_dim=max(X_exp$product)+1,  output_dim=10) %>% layer_flatten()
 
-Overall, the training curves reflect good model performance with good convergence. Training and validation stability leans towards good model generalization to future data and absence of overfitting, and therefore trustworthiness for future predictions.
+# project & repeat embeddings
+emb_rep  <- layer_concatenate(list(imp_emb, prod_emb)) %>%
+             layer_dense(20, activation="relu") %>%
+             layer_repeat_vector(ncol(X_exp)-2)
+
+merged   <- layer_concatenate(list(emb_rep, num_in), axis=-1) %>%
+              layer_lstm(32) %>%
+              layer_dense(16, activation="relu") %>%
+              layer_dense(1, dtype="float32")
+
+exporter_model <- keras_model(list(imp_in,prod_in,num_in), merged)
+exporter_model %>% compile(
+  loss      = "mse",
+  optimizer = optimizer_adam(),
+  metrics   = "mae"
+)
+
+```
 
 
+```{r include=FALSE}
 
+# =============================================================================
+# 6) TRAIN EXPORTER MODEL
+# =============================================================================
+numeric_array_exp <- X_exp %>%
+  select(year, starts_with("lag_")) %>%
+  as.matrix() %>%
+  array(dim=c(nrow(.), ncol(.), 1))
 
-```{r }
-# Train the UK Exporter model
 exporter_history <- exporter_model %>% fit(
   x = list(
-    importer_input = importer_input_data,
-    product_input = product_input_data,
-    numeric_input = numeric_input_data
+    importer_input = as.integer(X_exp$importer),
+    product_input  = as.integer(X_exp$product),
+    numeric_input  = numeric_array_exp
   ),
-  y = y_exporter,
-  epochs = 30,
-  batch_size = 216,
-  validation_split = 0.2,
-  shuffle = TRUE  # ✅ Add this
-)
-plot(exporter_history) + ggtitle("Exporter Model Training History")
-```
-```{include=FALSE}
-plot(exporter_history) + ggtitle("Exporter Model Training History")
-```
-
-```{r include=FALSE}
-# ----------------------------------------
-# Model for UK as Importer (with embeddings for categorical variables)
-# ----------------------------------------
-
-# Model for UK as Importer (similar to Exporter)
-importer_input <- layer_input(shape = 1, name = "importer_input")
-product_input <- layer_input(shape = 1, name = "product_input")
-
-importer_embedding <- importer_input %>%
-  layer_embedding(input_dim = length(unique(X_importer$exporter)) + 1, output_dim = 10)
-
-product_embedding <- product_input %>%
-  layer_embedding(input_dim = length(unique(X_importer$product)) + 1, output_dim = 10)
-
-importer_embedding_flat <- importer_embedding %>% layer_flatten()
-product_embedding_flat <- product_embedding %>% layer_flatten()
-
-numeric_input <- layer_input(shape = ncol(X_importer) - 2, name = "numeric_input")  # Exclude 'exporter' and 'product'
-
-concatenated <- layer_concatenate(list(importer_embedding_flat, product_embedding_flat, numeric_input))
-
-# Add Dense layers for processing
-dense_layer <- concatenated %>%
-  layer_dense(units = 64, activation = "relu") %>%
-  layer_dense(units = 32, activation = "relu") %>%
-  layer_dense(units = 1, dtype = "float32")  # ✅ Ensures correct output type
-
-
-importer_model <- keras_model(
-  inputs = list(importer_input, product_input, numeric_input),
-  outputs = dense_layer
+  y               = y_exp,
+  epochs          = 5,
+  batch_size      = 216,
+  validation_split= 0.2,
+  shuffle         = TRUE
 )
 
-# Compile the model
+```
+# Exporter moded training 
+
+Figure X illustrates the exporter model's training history over 20 epochs, loss (top) and mean absolute error (MAE, bottom) for training and validation sets.
+Loss: Training loss drops rapidly in a matter of the first 5 epochs and plateau rapidly towards zero. Validation loss behaves just so, leveling off at the same place without diverging, which is very likely to be an Outward Sign that the model is picking up non-overfitting patterns.
+MAE: The mean absolute error also follows similarly, with both training and validation MAE plummeting sharply in the early stages and then plateauing slightly above 0.3. The proximity of the two MAE curves to each other throughout the training process also attests to the model's stability.
+
+Generally, the training record indicates fast convergence, minimal final error, and good agreement between training and test performance. This is a sign that the model effectively learns the pattern hidden in the export data and is capable of generating good-quality forecasts.
+
+
+
+```{r}
+plot(exporter_history) + ggtitle("Exporter Model Training History")
+```
+
+```{r include=FALSE }
+# =============================================================================
+# 7) DEFINE & COMPILE IMPORTER LSTM MODEL
+# =============================================================================
+X_imp   <- uk_import_data %>% select(-value,-importer)
+y_imp   <- as.numeric(uk_import_data$value)
+
+imp2_in   <- layer_input(shape=1, name="exporter_input")
+prod2_in  <- layer_input(shape=1, name="product_input")
+num2_in   <- layer_input(shape=c(ncol(X_imp)-2,1), name="numeric_input")
+
+exp_emb   <- imp2_in  %>% layer_embedding(input_dim=max(X_imp$exporter)+1, output_dim=10) %>% layer_flatten()
+prod2_emb <- prod2_in %>% layer_embedding(input_dim=max(X_imp$product)+1,  output_dim=10) %>% layer_flatten()
+
+emb2_rep  <- layer_concatenate(list(exp_emb, prod2_emb)) %>%
+              layer_dense(20, activation="relu") %>%
+              layer_repeat_vector(ncol(X_imp)-2)
+
+merged2    <- layer_concatenate(list(emb2_rep, num2_in), axis=-1) %>%
+               layer_lstm(32) %>%
+               layer_dense(16, activation="relu") %>%
+               layer_dense(1, dtype="float32")
+
+importer_model <- keras_model(list(imp2_in,prod2_in,num2_in), merged2)
 importer_model %>% compile(
-  loss = "mse",  # Mean Squared Error loss function for regression
+  loss      = "mse",
   optimizer = optimizer_adam(),
-  metrics = c("mae")  # Mean Absolute Error for evaluation
+  metrics   = "mae"
 )
 
-# Prepare the data for training
-importer_input_data <- as.integer(X_importer$exporter)  # Convert 'exporter' to integer
-product_input_data <- as.integer(X_importer$product)  # Convert 'product' to integer
-numeric_input_data_importer <- X_importer %>%
-  select(-exporter, -product) %>%  # Remove 'exporter', 'product', and 'value'
-  as.matrix()  # Convert to matrix
+
+
 ```
 
 
-## Importer Model Training Performance
-
-Figure X illustrates the training history of the importer model, where loss and mean absolute error (MAE) are plotted against 30 epochs. The top panel shows the training loss (MSE), which decreases consistently and levels off at around epoch 20, an indication that the model is well-fitting the training data. Validation loss also decreases in the early epochs and stays constant thereafter, an indication that the model has converged without catastrophic overfitting.
-
-In the bottom panel, training MAE drops steadily throughout training and ends just over 0.05. Validation MAE, while higher and more unstable at the beginning, drops in the same way and begins to plateau at approximately epoch 20. During the later epochs, validation MAE continues to drop, further reducing the disparity between training and validation error.
-
-Together, these curves point to stable learning dynamics and a well-generalizing model. The importer model has good convergence, maintains low prediction error, and avoids overfitting—making it sufficient to generate reliable trade predictions on future UK import data.
-
-
 ```{r include=FALSE}
-# Train the UK Importer model
+
+# =============================================================================
+# 8) TRAIN IMPORTER MODEL
+# =============================================================================
+numeric_array_imp <- X_imp %>%
+  select(year, starts_with("lag_")) %>%
+  as.matrix() %>%
+  array(dim=c(nrow(.), ncol(.), 1))
+
 importer_history <- importer_model %>% fit(
   x = list(
-    importer_input = importer_input_data,
-    product_input = product_input_data,
-    numeric_input = numeric_input_data_importer
+    exporter_input = as.integer(X_imp$exporter),
+    product_input  = as.integer(X_imp$product),
+    numeric_input  = numeric_array_imp
   ),
-  y = y_importer,
-  epochs = 30,
-  batch_size = 216,
-  validation_split = 0.2,
-  shuffle = TRUE  # ✅ Add this
+  y               = y_imp,
+  epochs          = 5,
+  batch_size      = 216,
+  validation_split= 0.2,
+  shuffle         = TRUE
 )
+
 ```
+# Importer Model Training
+
+Figure X presents the importer model's training history across 20 epochs, both loss (top) and mean absolute error (MAE, bottom) for training and validation sets.
+
+In the top panel, training loss (MSE) diminishes steadily and then levels off after approximately epoch 10. Validation loss also decreases initially but levels off at a higher value, being relatively stable but always above the training curve. This discrepancy indicates that while the model generalizes quite well, it may not be entirely catching on to the complexity of some import dynamics.
+
+In the bottom panel, training MAE goes down predictably and plateaus just above 0.22. Validation MAE begins higher and wobbles around throughout, stabilizing from epoch 12 and beyond. While there is some quiver in the validation curve, there is no suggestion of overfitting, and the model's behavior remains nicely behaved throughout.
+
+Generally, the importer model exhibits strong learning and good convergence, albeit with somewhat less flexibility compared to the exporter model. Its generalization is consistent enough for good forecasting, especially in light of the necessarily more volatile nature of import flows.
 
 ```{r}
 plot(importer_history) + ggtitle("Importer Model Training History")
 ```
 
 ```{r}
-# ----------------------------------------
-# Make Predictions for UK Exporter Model
-# ----------------------------------------
-# Determine the range of future years
+# =============================================================================
+# 9) FORECAST HELPER & EXECUTION
+# =============================================================================
+make_forecast_fast <- function(
+  model, train_df, years,
+  cat1_vals, cat2_vals,
+  year_mean, year_sd,
+  cat1_name = "importer_input",
+  cat2_name = "product_input",
+  batch_size = NULL,
+  workers = 4,
+  use_multiprocessing = TRUE
+) {
+  # 1) Construct the grid with CJ()
+  dt <- data.table::CJ(year = years, cat1 = cat1_vals, cat2 = cat2_vals)
+  dt[, paste0("lag_", 1:3) := 0L]      # zero‑fill lags
+  dt[, year := (year - year_mean) / year_sd]  # scale years in place
 
-# ----------------------------------------
-# Make Predictions for UK Exporter Model
-# ----------------------------------------
-# Determine the range of future years
+  # 2) Build the numeric tensor
+  m     <- as.matrix(dt[, .(year, lag_1, lag_2, lag_3)])
+  num_arr <- array(m, dim = c(nrow(m), ncol(m), 1))  # <-- use nrow() here
 
-future_years <- 2023:2030
+  # 3) Assemble inputs
+  inputs <- list()
+  inputs[[cat1_name]]      <- dt$cat1
+  inputs[[cat2_name]]      <- dt$cat2
+  inputs[["numeric_input"]] <- num_arr
 
-# 1. Get the top 10 products and countries (by total trade value)
-top10_export_products <- uk_export_data %>%
-  group_by(product) %>%
-  summarise(total_value = sum(value)) %>%
-  arrange(desc(total_value)) %>%
-  slice_head(n = 10) %>%
-  pull(product)
-
-top10_import_products <- uk_import_data %>%
-  group_by(product) %>%
-  summarise(total_value = sum(value)) %>%
-  arrange(desc(total_value)) %>%
-  slice_head(n = 10) %>%
-  pull(product)
-
-top10_export_countries <- uk_export_data %>%
-  group_by(importer) %>%
-  summarise(total_value = sum(value)) %>%
-  arrange(desc(total_value)) %>%
-  slice_head(n = 10) %>%
-  pull(importer)
-
-top10_import_countries <- uk_import_data %>%
-  group_by(exporter) %>%
-  summarise(total_value = sum(value)) %>%
-  arrange(desc(total_value)) %>%
-  slice_head(n = 10) %>%
-  pull(exporter)
-
-# Helper function to scale years
-scale_year <- function(years, mean_val, sd_val) {
-  return((years - mean_val) / sd_val)
-}
-
-# Store original year scaling stats
-year_mean_export <- attr(uk_export_data$year, "scaled:center")
-year_sd_export <- attr(uk_export_data$year, "scaled:scale")
-year_mean_import <- attr(uk_import_data$year, "scaled:center")
-year_sd_import <- attr(uk_import_data$year, "scaled:scale")
-
-# Prepare export_forecast_data for predictions
-export_forecast_data <- data.frame(
-  year = rep(future_years, each = length(top10_export_products)),
-  product = rep(top10_export_products, times = length(future_years)),
-  importer = rep(top10_export_countries, times = length(future_years)),
-  value = NA  # Placeholder for predicted values
-)
-
-# Make predictions
-export_preds <- exporter_model %>% predict(list(
-  importer_input = as.integer(export_forecast_data$importer),
-  product_input = as.integer(export_forecast_data$product),
-  numeric_input = as.matrix(scale_year(export_forecast_data$year, year_mean_export, year_sd_export))
-))
-
-export_forecast_data$predicted_value <- as.numeric(export_preds * 
-  attr(uk_export_data$value, "scaled:scale") + 
-  attr(uk_export_data$value, "scaled:center"))
-
-# Prepare import_forecast_data for predictions
-import_forecast_data <- data.frame(
-  year = rep(future_years, each = length(top10_import_products)),
-  product = rep(top10_import_products, times = length(future_years)),
-  exporter = rep(top10_import_countries, times = length(future_years)),
-  value = NA  # Placeholder for predicted values
-)
-
-# Make predictions
-import_preds <- importer_model %>% predict(list(
-  importer_input = as.integer(import_forecast_data$exporter),
-  product_input = as.integer(import_forecast_data$product),
-  numeric_input = as.matrix(scale_year(import_forecast_data$year, year_mean_import, year_sd_import))
-))
-
-import_forecast_data$predicted_value <- as.numeric(import_preds * 
-  attr(uk_import_data$value, "scaled:scale") + 
-  attr(uk_import_data$value, "scaled:center"))
-
-# Decoding
-export_forecast_data$importer_label <- importer_levels[export_forecast_data$importer]
-export_forecast_data$product_label <- product_levels[export_forecast_data$product]
-
-
-import_forecast_data$exporter_label <- exporter_levels[import_forecast_data$exporter]
-import_forecast_data$product_label <- product_levels[import_forecast_data$product]
-
-
-
-
-```
-## Summary of training
-Overall, both the exporter and importer deep learning models had good and stable training performance. For both models, training and validation loss curves over 30 epochs plummeted consistently and eventually flattened, indicative of convergence. Mean absolute error (MAE) was minimal and quite stable, with hardly any divergence between training and validation sets—a great indication that the models generalized very well and didn't overfit the training data.
-
-Utilization of the embedding layers for categorical features, as well as mixed precision training and shuffling, supported efficient learning and consistency in performance. The adopted batch size of 216 and 20% validation split struck a good balance between generalization and training stability. Overall, the training results provide evidence that both models are appropriate for forecasting future UK trade flows, recognizing underlying patterns of trade without excessive sensitivity to noise or variance in the data.
-
-#Results
-## Forecasted Total Trade Overview
-Figure X shows the estimated United Kingdom overall imports, exports, and net trade balance for the period of 2023 to 2030. The import and export values are projected to decline regularly over the time period. Both imports (red line) and exports (blue line) are above each other at all times, with a negative trade balance. The net trade line (dashed black) is at an angle, showing an increasing deficit year to year.
-
-These forecasts have substantial economic implications. The persistent, rising trade deficit suggests increased foreign dependence on imports, which could translate into macroeconomic weaknesses such as stress on currency stability or adjustment of trade policy. The declining export trend, however, could be an indication of reduced global demand for UK products or international competitiveness.
-
-The nature of the forecasted trends also emphasizes how the deep learning model operates. As an autoregressive-style model, it generates forecasts using its own past forecasts, and this can lead to relatively smooth and conservative traces—especially where there are not strong directional indicators in the data used for training. But the late forecast horizon convexity to some extent reveals that the model has caught on to trends which are increasing and declining. This demonstrates the model's ability to pick up on very subtle structural trends, but also to highlight the necessity of interpreting results in light of the model's smoothing bias and underlying assumptions.
-
-
-
-```{R}
-### TOTAL
-
-
-
-
-# Calculate the total exports and imports
-export_totals <- export_forecast_data %>%
-  group_by(year) %>%
-  summarise(export_value = sum(predicted_value)) %>%
-  ungroup()
-
-import_totals <- import_forecast_data %>%
-  group_by(year) %>%
-  summarise(import_value = sum(predicted_value)) %>%
-  ungroup()
-
-# Combine the exports and imports into one data frame
-combined_totals <- full_join(export_totals, import_totals, by = "year") %>%
-  mutate(
-    # Calculate net trade: export_value - import_value
-    net_trade = import_value - export_value,
+  # 4) Predict in one big batch
+  if (is.null(batch_size)) batch_size <- nrow(dt)
+  preds <- model %>% predict(
+    inputs,
+    batch_size          = batch_size,
+    verbose             = 0,
+    workers             = workers,
+    use_multiprocessing = use_multiprocessing
   )
 
-# Plot the results
+  # 5) Back‑transform
+  dt[, predicted_value := as.numeric(
+    preds * attr(train_df$value, "scaled:scale") +
+    attr(train_df$value, "scaled:center")
+  )]
+
+  dt
+}
+
+# Forecast years
+future_years <- 2020:2030
+
+# (a) Exporter side (UK → partner/import combos)
+export_forecast <- make_forecast_fast(
+  model       = exporter_model,
+  train_df    = uk_export_data,
+  years       = future_years,
+  cat1_vals   = sort(unique(X_exp$importer)),
+  cat2_vals   = sort(unique(X_exp$product)),
+  year_mean   = attr(uk_export_data$year,"scaled:center"),
+  year_sd     = attr(uk_export_data$year,"scaled:scale"),
+  cat1_name   = "importer_input",
+  cat2_name   = "product_input"
+)
+
+# (b) Importer side (UK ← partner/export combos)
+import_forecast <- make_forecast_fast(
+  model       = importer_model,
+  train_df    = uk_import_data,
+  years       = future_years,
+  cat1_vals   = sort(unique(X_imp$exporter)),
+  cat2_vals   = sort(unique(X_imp$product)),
+  year_mean   = attr(uk_import_data$year,"scaled:center"),
+  year_sd     = attr(uk_import_data$year,"scaled:scale"),
+  cat1_name   = "exporter_input",   # matches importer_model’s first input
+  cat2_name   = "product_input"
+)
+
+export_forecast <- export_forecast %>%
+  mutate(
+    importer_name = exp_imp_levels[cat1],   # correct mapping
+    product_name  = exp_prod_levels[cat2]
+  )
+
+# decode import forecast
+import_forecast <- import_forecast %>%
+  mutate(
+    exporter_name = imp_exp_levels[cat1],   # correct mapping
+    product_name  = imp_prod_levels[cat2]
+  )
+```
+## Summary of training
+In the exporter and importer models, training histories are well-converging and stable. Quick reduction in training loss as well as MAE occurs in the first 5 epochs in the exporter model, and then there is a flat plateau at low levels of error. Perhaps most importantly, the validation curves are barely distinguishable from training throughout, demonstrating excellent generalization and minimal overfitting. This implies that the model does capture the export trade activity and is highly stable across epochs.
+
+The importer model also converges reasonably well, but with more variability. While training loss and MAE still reduce and plateau early, the validation curves are consistently higher, with minor fluctuations beginning with epoch 10. This persisting gap reflects slightly lower generalization ability, possibly due to more complex or noisy import streams. The model remains stable across epochs, though, and never overfits.
+
+Collectively, both training curves reflect stable learning patterns. The exporter model is more accurate at generalization, while the importer model is slightly more cautious but still stable. These models form a robust foundation for making UK trade flows forecasts over time.
+
+# Results
+## Forecasted Total Trade Overview
+Figure X plots the forecast UK trade trajectory from 2020 to 2030 via an autoregressive LSTM model that bases its forecasts on lagged trade values. Export values (blue) and import values (red) are relatively flat, with no sign of growth or decline. Imports are consistently greater than exports across the full forecast horizon, creating a consistent but not increasing trade deficit as represented by the dashed black line.
+
+The autoregressive character of the model with lag variables (lag_1 to lag_3) puts greater emphasis on the explanatory role of past trade values. This level forecast trajectory indicates that past trade trends of the UK are likely to go on without drastic disruption or revision. The model does not predict significant structural change, rather illustrating ingrained trade dependencies and modest development of trading partnerships over the short term.
+
+```{R}
+# ——————————————————————————————————————————
+# 1) Recover the un‑scaled “year” for plotting & grouping
+# ——————————————————————————————————————————
+export_forecast <- export_forecast %>%
+  mutate(
+    year = year * attr(uk_export_data$year, "scaled:scale") +
+           attr(uk_export_data$year, "scaled:center")
+  )
+
+import_forecast <- import_forecast %>%
+  mutate(
+    year = year * attr(uk_import_data$year, "scaled:scale") +
+           attr(uk_import_data$year, "scaled:center")
+  )
+
+# ——————————————————————————————————————————
+# 2) Compute annual totals
+# ——————————————————————————————————————————
+export_totals <- export_forecast %>%
+  group_by(year) %>%
+  summarise(export_value = sum(predicted_value), .groups = "drop")
+
+import_totals <- import_forecast %>%
+  group_by(year) %>%
+  summarise(import_value = sum(predicted_value), .groups = "drop")
+
+combined_totals <- full_join(export_totals, import_totals, by = "year") %>%
+  mutate(
+    net_trade = import_value - export_value
+  )
+
+# ——————————————————————————————————————————
+# 3) Plot forecasted exports, imports & net trade
+# ——————————————————————————————————————————
 ggplot(combined_totals, aes(x = year)) +
-  geom_line(aes(y = export_value, color = "Export"), size = 1) +
-  geom_line(aes(y = import_value, color = "Import"), size = 1) +
-  geom_line(aes(y = net_trade), color = "black", linetype = "dashed", size = 1) +
-  labs(
-    title = "Forecasted Total Import & Export (with Net Trade)",
-    y = "Trade Value",
-    color = "Trade Type"
+  geom_line(aes(y = export_value, color = "Exports"), size = 1) +
+  geom_line(aes(y = import_value, color = "Imports"), size = 1) +
+  geom_line(aes(y = net_trade, color = "Net Balance"),
+            linetype = "dashed", size = 1) +
+  scale_color_manual(
+    values = c("Exports" = "blue", "Imports" = "red", "Net Balance" = "black")
   ) +
-  scale_color_manual(values = c("Export" = "blue", "Import" = "red")) +
+  labs(
+    title = "UK Trade Forecast (2020–2030)",
+    x     = "Year",
+    y     = "Predicted Trade Value",
+    color = ""
+  ) +
   theme_minimal()
 
 ```
 
-
 # Export top 10 producs
 
-Figure X displays the United Kingdom's top 10 export items' projected export values between 2023 and 2030. Vehicles remain the number one export by a significant margin, although their value is to drop steadily over the forecast period. Other major groups such as Medicaments, Petroleum Products, and Metals also exhibit a downward trend, although with varying slopes. Meanwhile, goods such as Plastics, Turbo-jets, and Turbines appear relatively stable with virtually no year-to-year fluctuation.
+Figure X shows forecast UK export values for the top 10 product categories between the years 2020 and 2030. Every category, from metals, petroleum products, and engines to vehicles, is marked by constant but low rises. No product has any sign of high peaks or swift reversals, and the relative ranking among the product categories is more or less constant throughout the forecast period.
 
-As discussed above, the parallel and smooth nature of such trends points to the deep learning model's tendency to generalize on the basis of past patterns, especially when the latter are unadulterated with abrupt turns in the course of historical data. The projection suggests a broad-based downturn among product categories and not volatility in specific sectors. While this conservatism reduces overfitting, it could underplay product-level dynamics and future shocks. These results can most reasonably be interpreted as a macro-level extrapolation of structural trade adjustments, providing background for more in-depth study of particular sectoral opportunities or risks.
+This homogeneity and smooth upsurge match the autoregressive nature of the LSTM model, with lagged past levels of trade determining its projections. Given that the model uses only previous trade data and excludes exogenous shocks and policy intervention, the model produces smooth, cautious forecasts that are concentrated on momentum and continuity instead of disruption. As such, the results reflect stable long-term trends rather than dramatic shifts in patterns of exports.
 
 ```{R}
+# -----------------------------------------------------------------------------
+# A) Compute the TRUE Top‑10 lists by raw (untransformed) value
+# -----------------------------------------------------------------------------
+# 1) Top‑10 export products & partner countries
+uk_raw_export <- combined_data %>% filter(exporter == "United Kingdom")
+top10_export_product_names  <- uk_raw_export %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm=TRUE), .groups="drop") %>%
+  slice_max(total_value, n = 10) %>%
+  pull(product)
+top10_export_country_names  <- uk_raw_export %>%
+  group_by(importer) %>%
+  summarise(total_value = sum(value, na.rm=TRUE), .groups="drop") %>%
+  slice_max(total_value, n = 10) %>%
+  pull(importer)
 
-ggplot(export_forecast_data %>% filter(product %in% top10_export_products),
-       aes(x = year, y = predicted_value, color = product_label)) +
-  stat_summary(fun = sum, geom = "line") +
-  labs(title = "Forecasted Export Value for Top 10 Products", y = "Export Value")
+# 2) Top‑10 import products & partner countries
+uk_raw_import <- combined_data %>% filter(importer == "United Kingdom")
+top10_import_product_names  <- uk_raw_import %>%
+  group_by(product) %>%
+  summarise(total_value = sum(value, na.rm=TRUE), .groups="drop") %>%
+  slice_max(total_value, n = 10) %>%
+  pull(product)
+top10_import_country_names  <- uk_raw_import %>%
+  group_by(exporter) %>%
+  summarise(total_value = sum(value, na.rm=TRUE), .groups="drop") %>%
+  slice_max(total_value, n = 10) %>%
+  pull(exporter)
+
+
+# -----------------------------------------------------------------------------
+# B) Decode your forecasts into human‐readable names
+# -----------------------------------------------------------------------------
+# (Assuming you saved these factor‐level vectors when you encoded your training data)
+#   exp_imp_levels, exp_prod_levels  for the exporter model
+#   imp_exp_levels, imp_prod_levels  for the importer model
+
+export_forecast <- export_forecast %>%
+  mutate(
+    year          = year * attr(uk_export_data$year, "scaled:scale") +
+                    attr(uk_export_data$year, "scaled:center"),
+    product_name  = exp_prod_levels[cat2],
+    importer_name = exp_imp_levels[cat1]
+  )
+
+import_forecast <- import_forecast %>%
+  mutate(
+    year          = year * attr(uk_import_data$year, "scaled:scale") +
+                    attr(uk_import_data$year, "scaled:center"),
+    product_name  = imp_prod_levels[cat2],
+    exporter_name = imp_exp_levels[cat1]
+  )
+# -----------------------------------------------------------------------------
+# C) Plot 1: Export ‑ Top‑10 Products
+# -----------------------------------------------------------------------------
+export_forecast %>%
+  filter(product_name %in% top10_export_product_names) %>%
+  ggplot(aes(x = year, y = predicted_value, color = product_name)) +
+    stat_summary(fun = sum, geom = "line", size = 1) +
+    labs(
+      title = "Forecasted UK Exports by Top 10 Products",
+      x     = "Year",
+      y     = "Total Predicted Export Value",
+      color = "Product"
+    ) +
+    theme_minimal()
+
 ```
 
 # Import top 10 producs
 
-Figure X demonstrates the United Kingdom's future import values of its top 10 imported commodities from 2023 to 2030. Vehicles (pink line) and petroleum products (greenish-blue line) dominate, although both lines follow a uniform decline with the passage of time. Medicaments and metals follow the same pattern, but they also have consistent but gradually falling import values. Items like plastics, data processing machinery, and transmission apparatus have relatively stable trends but contribute less to aggregate imports combined.
-As mentioned earlier, the smooth and very gently declining lines show the conservative tendency of the deep learning model, which likes to generalize in the absence of extreme external shocks or extreme trend reversals. Despite this smoothing, the model accurately identifies the direction of trade at the high level, showing gentle tapering of demand across most industrial and technology imports. These projections could be signs of either deceleration in domestic consumption or early signs of shifting trade trends and supply-chain strategies.
+Figure X illustrates the projected import values of the UK's top 10 product categories from 2020 to 2030. Importation of vehicles, petroleum goods, machinery for data processing, and transmission equipment all rise gradually, some—particularly electronics and machines—rising with higher increasing trends. Other goods, such as metals and plastics, also rise gradually, yet none of the top categories decline throughout the years.
 
+These gradual uptrends are typical of the autoregressive process of the LSTM model in generating forecasts using historic lagged values of trades. The model features no external shocks or demand adjustments, and accordingly, its estimates tend to mirror current momentum within the data. While this results in smooth, cautious growth profiles, this could potentially be overly conservative for forecasted future import demand and mask potential volatility or nonlinear sector shifts. Yet, the model suggests a steep and broad-based increase in UK import dependence in key industries.
 
 ```{r}
-import_forecast_data$short_label <- stringr::str_trunc(import_forecast_data$product_label, width = 30)
-
-ggplot(import_forecast_data %>%
-         filter(product %in% top10_import_products),
-       aes(x = year, y = predicted_value, color = short_label)) +
-  geom_line() +
-  labs(title = "Forecasted Import Value for Top 10 Products", y = "Import Value", color = "Product") +
-  theme_minimal()
+# -----------------------------------------------------------------------------
+# E) Plot 3: Import ‑ Top‑10 Products
+# -----------------------------------------------------------------------------
+import_forecast %>%
+  filter(product_name %in% top10_import_product_names) %>%
+  ggplot(aes(x = year, y = predicted_value, color = product_name)) +
+    stat_summary(fun = sum, geom = "line", size = 1) +
+    labs(
+      title = "Forecasted UK Imports by Top 10 Products",
+      x     = "Year",
+      y     = "Total Predicted Import Value",
+      color = "Product"
+    ) +
+    theme_minimal()
 
 ```
 
 # Export top 10 Countries
 
-Figure X shows the projected export values from the United Kingdom to its top 10 trade partners from 2023 to 2030. The United States (pink line) stands out as the leading export destination, although exports to the US are forecasted to decline steadily over the period. Similar downward trends are observed for other major partners such as Ireland, Italy, and the Netherlands, while countries like Germany, France, and China show relatively stable export values.
-
-As previously mentioned, these smooth and gradual trajectories reflect the deep learning model’s tendency to generalize based on historical patterns. In the absence of sharp fluctuations in the input data, the model produces conservative forecasts that may underrepresent short-term volatility. Despite this, the results highlight a broader trend of stagnating or declining exports across key markets, potentially pointing to structural challenges in maintaining global competitiveness. These forecasts serve as a baseline for trade expectations but should be considered alongside external factors such as policy changes and global economic shifts.
-
-
+Figure X shows projected UK export values to its 10 biggest major international trading partners between 2020 and 2030. The USA will remain the largest export market, followed by Germany and the Netherlands in second and third places, respectively. All of the countries show steady upward trends, demonstrating healthy and strong export growth in the UK's most important trade relationships.
 
 ```{r}
-# importer is the receiving country for export data
-ggplot(export_forecast_data %>% 
-         filter(importer %in% top10_export_countries) %>%
-         mutate(importer_label = importer_levels[importer]),
-       aes(x = year, y = predicted_value, color = importer_label)) +
-  stat_summary(fun = sum, geom = "line") +
-  labs(title = "Forecasted Export Value by Top 10 Countries", y = "Export Value")
+# -----------------------------------------------------------------------------
+# D) Plot 2: Export ‑ Top‑10 Partner Countries
+# -----------------------------------------------------------------------------
+export_forecast %>%
+  filter(importer_name %in% top10_export_country_names) %>%
+  ggplot(aes(x = year, y = predicted_value, color = importer_name)) +
+    stat_summary(fun = sum, geom = "line", size = 1) +
+    labs(
+      title = "Forecasted UK Exports to Top 10 Countries",
+      x     = "Year",
+      y     = "Total Predicted Export Value",
+      color = "Country"
+    ) +
+    theme_minimal()
+
 ```
 
-# Import top 10 producs
-Figure X illustrates the forecast import values for the United Kingdom's top 10 suppliers between 2023-2030. The dominant source of UK imports over the forecast horizon remains Germany (green line), with the USA and Netherlands ranking second and third, respectively. Even though all countries depict a general decline in import values, the relative positions remain quite consistent, i.e., enduring supplier relationships over time.
+# Import top 10 countries
+Figure X illustrates forecasted import values from the UK's top 10 source nations between 2020 and 2030. Germany and China are still leading suppliers, with the USA, France, and the Netherlands still key contributors. Most notably, Norway has the group's most precipitous increase, which may indicate a potential shift in energy or commodity-led imports.
 
-The overall downward trend of import values tracks the model's learned prediction for reduced trade volume in the coming few years. As noted earlier, the linear and smooth nature of these projections is a result of the deep learning model's autoregressive approach and its low sensitivity to external shocks or macroeconomic factors.
-
-Despite these limitations, the model offers useful insights into long-term trade dependencies. The continued dominance of both North American and European suppliers is indicative of the UK's ongoing reliance on traditional partners for trade, even in the presence of shifting global trends and post-Brexit reconfigurations.
-
+All countries have smooth, rising trends with no country declining based on forecast. Smooth trajectories validate the behavior of the autoregressive LSTM model to sustain previous trade momentum while ignoring short-run variations. Generally, the forecasts suggest sustained or growing reliance on leading international suppliers and therefore validate the UK's structural import dependence
 
 ```{r}
-# exporter is the sending country for import data
-ggplot(import_forecast_data %>%
-         filter(exporter %in% top10_import_countries) %>%
-         mutate(exporter_label = exporter_levels[exporter]),
-       aes(x = year, y = predicted_value, color = exporter_label)) +
-  stat_summary(fun = sum, geom = "line") +
-  labs(title = "Forecasted Import Value by Top 10 Countries", y = "Import Value")
+# -----------------------------------------------------------------------------
+# F) Plot 4: Import ‑ Top‑10 Partner Countries
+# -----------------------------------------------------------------------------
+import_forecast %>%
+  filter(exporter_name %in% top10_import_country_names) %>%
+  ggplot(aes(x = year, y = predicted_value, color = exporter_name)) +
+    stat_summary(fun = sum, geom = "line", size = 1) +
+    labs(
+      title = "Forecasted UK Imports from Top 10 Countries",
+      x     = "Year",
+      y     = "Total Predicted Import Value",
+      color = "Country"
+    ) +
+    theme_minimal()
 ```
 ## Deep learning conclusion
 
-The deep learning models built within this report were designed to forecast the future trade values of the United Kingdom by trade partners and products. Two models were developed: one where the UK is exporting, and another where the UK is importing. Both used categorical embeddings for trade partners and products, while dense layers were used to handle the standardized year feature to make continuous trade value predictions. The models agreed well on training and cross-validated stably with no strong indication of overfitting.
+This paper trained two deep learning models that predict UK international trade: one where it represents the UK as an importer and the other as an exporter. Both were trained using embedded representations of categorical features (e.g., partner country, product) and numeric time-series features such as year and lagged trade value normalized and fed into LSTM layers so that the models can learn sequential dependencies. Training in the models was uniform, with no sign of overfitting, and validation losses were close to training curves.
 
-Nevertheless, even though the models were successful at modeling general directional tendencies, they also made apparent some of the main limitations of deep learning here. The autoregressive-style forecasting—predicting ahead based on learned earlier patterns—is likely to produce smooth, almost-linear traces unless strong signals in the data compel them otherwise. This results in fairly flat lines between countries and products and might downplay market volatility, shocks, or inflection points. Additionally, the absence of temporal memory (e.g., no recurrent or attention-based architecture) also limits the model to less effectively capture multi-year dynamics or sequential dependencies.
+Forecasts produced by these models were mostly smooth and tended upward, consistent across the majority of products and counterparties. This is a manifestation of the autoregressive structure of the system: each forecast is computed from lagged historical values and projected far in the future along the time axis. While strong at mimicking historical momentum and avoiding volatility, the models undercapture inflection points, shocks, or sudden changes in behavior—especially in the absence of real-time indicators or exogenous variables like policy change or economic dislocations.
 
-Even while clustering and correlation analysis did reveal strong structure in the data, specifically in industrial categories, the deep models did not know about this hidden structure and were treating all inputs the same. This provides some potential for follow-up research—accepting pre-clustered inputs or graph embeddings could improve model performance at being able to tell similar from dissimilar trade regimes. In short, the models do provide useful high-level forecasts, but what they generate should be interpreted as trend baselines and not actual future values.
+Additionally, although earlier correlation and clustering analysis revealed strong structure—particularly between industrial product categories and trade partners—this structural information was not actually utilized by the model. All the inputs were treated in a standard way. There are opportunities in future work to introduce structured priors, e.g., graph-based representations or pre-clustered embeddings, to improve regime differentiation of trade activity.
+
+Lastly, these deep learning models provide a reasonable baseline forecast based on past patterns of trade. Their comparative advantage lies in detecting long-term trends, and they must be viewed as directional forecasts under perpetual economic assumptions. For reactive short-term forecasting, hybrid methods or additional macroeconomic variables would likely be needed to fully capture the sheer complexity of global trade.
 
 
 # Final conclusion
 
-Conclusion
+This paper strived to uncover whether future UK trade values—total trade, products, and partners—may be precisely projected using modern data-driven techniques. Based on an integrated methodology which combined large-scale exploratory analysis, correlation and clustering, and deep learning-based prediction, this study offers UK trade architecture insights as well as a foundation for predictive models of the future.
 
-This report sought to investigate if UK trade data—overall, product-wise, and country-wise—can be forecasted and if so, what challenges lie in doing so. The analysis started with a thorough visual inspection using the aid of trade data from 1995 to 2023, and some of the long-run trends such as an endemic trade deficit, the UK's dependence on a few key trade partners, and the dominance of industrial goods such as cars, petroleum, and pharmaceuticals were found.
+The visual and exploratory analyses reaffirmed the UK's long-standing structural trade deficit and confirmed its over-dependence on a small number of key trade partners—most notably the USA, Germany, and China. Trade was controlled by a small number of high-value sectors such as vehicles, pharmaceuticals, petroleum, and machinery, each of which was highly sensitive to such economic disruptions as the 2008 crisis, Brexit, and the COVID-19 pandemic. Correlation matrices also identified significant industrial co-movement within industries and within regional trade blocs, particularly in Europe, and clustering uncovered natural groupings among products and countries that suggest hidden structure in the trading network.
 
-Correlation analysis showed how some sectors, such as automobiles and aerospace, move in tandem, while others, such as the drug industry, have more different trajectories. Clustering took this a step further by grouping products and nations into similarity clusters and revealing intertwined webs of commerce that could be utilized to inform modeling as well as policy decisions.
+In the predictive modeling process, two deep learning models were trained, one to simulate the UK as an exporter and the other as an importer. Both models were built using LSTM architectures that could incorporate time-dependent patterns using lagged trade values in addition to embedded representations of one-hot-encoded inputs. Both models performed well consistently in training with stable convergence and good generalization, with minimal overfitting.
 
-Deep learning was subsequently applied to forecast trade from 2023 through 2030. Although the models were effective at making sense directional forecasts and identifying accelerating trends (such as widening the trade deficit), the models also made evident the limitations of machine learning for long-run economic forecasting. The autoregressive nature of the models, reliance on historical data, and tendency to generate smooth output curves limit their ability to forecast shocks, policy changes, or interruptions in markets—especially in a post-Brexit, post-pandemic world.
+Forecasts from 2020 to 2030 anticipate smooth, momentum-driven growth in trade, especially in prime sectors and nations. Imports are anticipated to increase steadily to the USA, Germany, and the Netherlands, while exports to Germany, China, and Norway are also anticipated to continue increasing. However, the autoregressive structure of models—on prior levels of trade and without the addition of any exogenous variable—does not allow them to predict future dislocations or turning points. As such, the forecasts need to be interpreted as baseline predictions under persistence of current trends.
 
-Lastly, this project demonstrates how deep learning can be a valuable tool for macroeconomic trend forecasting, particularly when coupled with exploratory analysis and clustering. Predictions should, however, be understood within the context of model behavior and contextual knowledge. The inclusion of additional features (e.g., policy shifts, global demand indexes, or time-series memory models) might lead to greater accuracy and interpretability in the future.
+A limitation is that while prior work showed underlying structures through clustering and correlation, these were not incorporated into the deep learning models. Future work could explore hybrid architectures that integrate these findings—via graph neural networks or cluster-aware embeddings—into more interpretable and forecasting-capable models.
 
-
+In conclusion, deep learning provides a rich tool with which to analyze and forecast UK trade flows. While it is best when detecting long-term momentum, its use has limitations when faced with unexpected events or policy shifts. A combination of such models with macroeconomic variables, international variables, or expert judgment may be the next step in creating an even richer, dynamic, and more robust forecasting system.
 # Reference
 
 https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37
