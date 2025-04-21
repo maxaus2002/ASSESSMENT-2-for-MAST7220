@@ -1204,7 +1204,7 @@ https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37
 
 # appendix
 All code and supporting documents are available on github in the following perma link
-https://github.com/maxaus2002/ASSESSMENT-2-for-MAST7220/tree/4ee2afca34a870aa6cfba57fd4bb3f3344b36c84
+https://github.com/maxaus2002/ASSESSMENT-2-for-MAST7220
 
 Full version of report available on github
 Accompanying power point available on github (Mainly contains condesned versions of data ommitted from the condensed report but were present in the full report.)
